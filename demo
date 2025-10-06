@@ -1,0 +1,801 @@
+/*
+  Sales Ops Portal — News × Seasonality OS (MVP, single-file React)
+  ---------------------------------------------------------------
+  Purpose:
+    Internal portal to convert "news × seasonality" signals into concrete sales actions
+    (prioritization, deal creation, SLA tracking, and basic experiment logging).
+
+  Notes:
+    - Single-file React component suitable for ChatGPT canvas preview.
+    - Uses Tailwind (available globally), lucide-react for icons, recharts for charts.
+    - No backend: data persists to localStorage for demo; swap Storage API to plug in real DB.
+    - Includes:
+        • Dashboard (Top Signals / Priority Top 20 / Heatmap / Alerts / Stock & Capacity)
+        • Map × Calendar (simple SVG scatter map + calendar list)
+        • Signal Inbox (filterable; one-click to create Deal)
+        • Priority Ranking (sortable table; formula with tunable weights)
+        • Deals (detail modal; SLA, target live date, chain playbook hints)
+        • Experiments (step‑wedge / DiD template capture; tie to KPI = touches)
+        • Admin (weights, dictionaries, seed/reset)
+
+  How to extend:
+    - Replace MOCK_DATA + Storage with API calls.
+    - Connect real JNTO / visas / cruise schedules / opening news via ETL (RSS, CSV, manual upload).
+    - Add RBAC via SSO and route-level guards when moving to full app framework (Next.js etc.).
+*/
+
+import React, { useEffect, useMemo, useState } from "react";
+import { motion } from "framer-motion";
+import {
+  Activity,
+  AlertTriangle,
+  Anchor,
+  BadgeCheck,
+  BarChart3,
+  Bell,
+  Building2,
+  Calendar as CalendarIcon,
+  CheckCircle2,
+  ChevronDown,
+  ClipboardCheck,
+  Compass,
+  Filter,
+  Globe2,
+  LibraryBig,
+  Loader2,
+  Map as MapIcon,
+  Plane,
+  RefreshCw,
+  Rocket,
+  Settings,
+  Ship,
+  Sparkles,
+  Target,
+  TrendingUp,
+} from "lucide-react";
+import {
+  ResponsiveContainer,
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  BarChart,
+  Bar,
+} from "recharts";
+
+// ---------- Types ----------
+
+/** @typedef {"event"|"visa"|"route"|"cruise"|"population"|"weather"|"opening"|"chain"|"forecast"} SignalType */
+/** @typedef {"hotel"|"convenience"|"donki"|"mall"|"station"|"airport"|"port"|"tourist"} LocationType */
+/** @typedef {"prospect"|"negotiation"|"approved"|"installing"|"live"} DealStage */
+
+/** @typedef {{
+ *  id: string; type: SignalType; title: string; source: string; trust: number; // 0..1
+ *  area: string; lat?: number; lng?: number;
+ *  startAt: string; endAt: string; deadline: string;
+ *  deltaTouch: number; // expected uplift/day at peak
+ *  recommended: string[];
+ * }} Signal */
+
+/** @typedef {{ area: string; weekISO: string; index: number; tags: string[] }} SeasonalityIndex */
+
+/** @typedef {{
+ *  id: string; name: string; chain: string; type: LocationType; area: string;
+ *  lat: number; lng: number; installability: number; // 0..1
+ *  power: boolean; line: boolean; whitespace: number; // 0..1
+ *  corner: number; // 0..1 "Othello corner" horizontal expansion potential
+ *  risk: number; // 0..1 higher = riskier
+ * }} Location */
+
+/** @typedef {{
+ *  id: string; locationId: string; stage: DealStage; targetLiveAt: string; capex: number; roiEst: number;
+ *  sla: { contactBy: string; approvalBy: string; constructBy: string; liveBy: string };
+ *  notes: string; createdAt: string; signalId?: string;
+ * }} Deal */
+
+/** @typedef {{
+ *  id: string; design: "stepwedge"|"did"|"synth"; name: string; startAt: string; endAt: string;
+ *  groups: string; metric: string; minDetectableEffect: number; significant?: boolean;
+ * }} Experiment */
+
+/** @typedef {{ demand: number; whitespace: number; corner: number; lead: number; feas: number; stock: number; risk: number }} Weights */
+
+// ---------- Utilities ----------
+
+const fmt = new Intl.NumberFormat("ja-JP");
+const fmtPct = (v) => `${Math.round(v * 100)}%`;
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const addDaysISO = (iso, d) => new Date(new Date(iso).getTime() + d * 86400000).toISOString().slice(0, 10);
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+
+// Projected Japan-ish bounds for quick scatter (no basemap)
+const JAPAN_BOUNDS = { latMin: 24, latMax: 45.5, lngMin: 123.5, lngMax: 146.5 };
+const projectXY = (lat, lng, w, h) => {
+  const x = ((lng - JAPAN_BOUNDS.lngMin) / (JAPAN_BOUNDS.lngMax - JAPAN_BOUNDS.lngMin)) * w;
+  const y = (1 - (lat - JAPAN_BOUNDS.latMin) / (JAPAN_BOUNDS.latMax - JAPAN_BOUNDS.latMin)) * h;
+  return { x, y };
+};
+
+// ---------- Mock & Storage ----------
+
+const Storage = {
+  load(key, fallback) {
+    try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
+  },
+  save(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} },
+};
+
+const AREAS = ["東京", "大阪", "京都", "白馬", "日光", "横浜", "那覇", "札幌"];
+
+const MOCK_LOCATIONS /** @type {Location[]} */ = [
+  { id: "L-TYO-DONKI-GINZA", name: "ドン・キホーテ 銀座本館", chain: "DonKi", type: "donki", area: "東京", lat: 35.671, lng: 139.765, installability: .9, power: true, line: true, whitespace: .4, corner: .9, risk: .2 },
+  { id: "L-OSK-DONKI-DOTON", name: "ドン・キホーテ 道頓堀店", chain: "DonKi", type: "donki", area: "大阪", lat: 34.668, lng: 135.501, installability: .9, power: true, line: true, whitespace: .5, corner: .85, risk: .25 },
+  { id: "L-TYO-APA-SHINJ", name: "アパホテル 新宿", chain: "APA", type: "hotel", area: "東京", lat: 35.693, lng: 139.703, installability: .8, power: true, line: true, whitespace: .6, corner: .6, risk: .2 },
+  { id: "L-KYT-HOTEL-GION", name: "HMJ 京都 祇園", chain: "HMJ", type: "hotel", area: "京都", lat: 35.003, lng: 135.778, installability: .85, power: true, line: true, whitespace: .5, corner: .6, risk: .2 },
+  { id: "L-HKB-SKI-BASE", name: "白馬ゴンドラベース", chain: "Resort", type: "tourist", area: "白馬", lat: 36.699, lng: 137.861, installability: .7, power: true, line: false, whitespace: .8, corner: .7, risk: .35 },
+  { id: "L-NKK-TEMPLE-GATE", name: "日光 東照宮 表参道", chain: "Tourism", type: "tourist", area: "日光", lat: 36.757, lng: 139.598, installability: .6, power: true, line: false, whitespace: .7, corner: .65, risk: .3 },
+  { id: "L-YKH-PIER", name: "横浜大さん橋ターミナル", chain: "Port", type: "port", area: "横浜", lat: 35.446, lng: 139.653, installability: .9, power: true, line: true, whitespace: .5, corner: .75, risk: .2 },
+  { id: "L-NHA-KOKUSAI", name: "那覇クルーズターミナル", chain: "Port", type: "port", area: "那覇", lat: 26.214, lng: 127.673, installability: .85, power: true, line: true, whitespace: .55, corner: .7, risk: .25 },
+];
+
+const MOCK_SIGNALS /** @type {Signal[]} */ = [
+  { id: "S-EXPO2025", type: "event", title: "大阪・関西万博 会期", source: "Expo calendar", trust: 0.95, area: "大阪", startAt: "2025-04-13", endAt: "2025-10-13", deadline: "2025-01-15", deltaTouch: 260, recommended: ["万博国別デー言語対応", "梅田・難波・空港導線厚め"] },
+  { id: "S-YKH-CRUISE-1120", type: "cruise", title: "クルーズ大型船 横浜寄港(3,200名)", source: "Port schedule", trust: 0.9, area: "横浜", lat: 35.446, lng: 139.653, startAt: addDaysISO(todayISO(), 14), endAt: addDaysISO(todayISO(), 14), deadline: addDaysISO(todayISO(), 7), deltaTouch: 180, recommended: ["大さん橋〜山下公園導線掲出", "臨時増設1台"] },
+  { id: "S-VISA-TH-EXT", type: "visa", title: "タイ観光ビザ政策の緩和動向", source: "MOFA/JNTO", trust: 0.8, area: "東京", startAt: todayISO(), endAt: addDaysISO(todayISO(), 60), deadline: addDaysISO(todayISO(), 10), deltaTouch: 60, recommended: ["多言語(TH)MEO更新", "浅草/秋葉原のピン最適化"] },
+  { id: "S-SKI-HAKUBA", type: "forecast", title: "白馬スキー需要指数↑ (12-3月)", source: "Seasonality model", trust: 0.85, area: "白馬", startAt: "2025-12-01", endAt: "2026-03-31", deadline: "2025-10-15", deltaTouch: 140, recommended: ["8-10月に商談/工事確定", "ゴンドラ乗り場周辺を角指定"] },
+  { id: "S-OPEN-HOTEL-KYOTO", type: "opening", title: "京都 祇園エリア 新設ホテル(来春OP)情報", source: "Press", trust: 0.7, area: "京都", startAt: "2026-03-15", endAt: "2026-03-15", deadline: "2025-11-30", deltaTouch: 90, recommended: ["T-6ヶ月一次接触", "客室/EV掲出テンプレ配布"] },
+  { id: "S-POP-MATSUDO", type: "population", title: "松戸：在住外国人増勢（留学/就労）", source: "Municipal stats", trust: 0.8, area: "東京", startAt: todayISO(), endAt: addDaysISO(todayISO(), 365), deadline: addDaysISO(todayISO(), 20), deltaTouch: 40, recommended: ["行政/銀行/携帯ショップ導線の常設厚め"] },
+];
+
+const MOCK_SEASON /** @type {SeasonalityIndex[]} */ = (() => {
+  const weeks = 12; // display horizon
+  const out = [];
+  for (const area of AREAS) {
+    for (let w = 0; w < weeks; w++) {
+      const base = 40 + Math.random() * 40;
+      const bump = (area === "日光" && (w === 2 || w === 3)) ? 35 : 0; //紅葉
+      const ski = (area === "白馬" && (w >= 8)) ? 30 : 0; //冬近づくと上昇
+      const expo = (area === "大阪" && (w >= 4 && w <= 10)) ? 20 : 0; //会期近傍
+      out.push({ area, weekISO: addDaysISO(todayISO(), w * 7), index: Math.round(clamp((base + bump + ski + expo), 0, 100)), tags: [] });
+    }
+  }
+  return out;
+})();
+
+const DEFAULT_WEIGHTS /** @type {Weights} */ = {
+  demand: 0.35, whitespace: 0.2, corner: 0.15, lead: 0.1, feas: 0.1, stock: 0.1, risk: 0.1,
+};
+
+// ---------- Priority Score ----------
+
+/**
+ * Compute location priority score for a given area context & signals.
+ * @param {Location} loc
+ * @param {SeasonalityIndex[]} season
+ * @param {Signal[]} signals
+ * @param {Weights} w
+ */
+function computePriority(loc, season, signals, w) {
+  const now = todayISO();
+  const sThis = season.filter((s) => s.area === loc.area).slice(0, 8); // next 8 weeks
+  const sMax = sThis.reduce((m, s) => Math.max(m, s.index), 1);
+  const demandIndex = sMax / 100; // 0..1
+
+  // Signals in this area within next 6 weeks
+  const sig = signals.filter(
+    (x) => x.area === loc.area && new Date(x.startAt) <= new Date(addDaysISO(now, 42))
+  );
+  const deltaTouch = sig.reduce((sum, x) => sum + x.deltaTouch * x.trust, 0);
+  const demand = clamp(demandIndex + deltaTouch / 1000, 0, 1); // normalized
+
+  const whitespace = loc.whitespace; // 0..1
+  const corner = loc.corner; // 0..1
+  const feas = (loc.installability + (loc.power ? 0.1 : -0.2) + (loc.line ? 0.1 : -0.2)) / 1.3; // approx
+  const stock = 0.8; // placeholder from inventory fit; tune with real data
+  const risk = loc.risk; // 0..1
+
+  // Lead: nearing deadlines in signals => higher urgency
+  const soonSig = sig
+    .map((x) => ({ x, d: (new Date(x.deadline) - new Date(now)) / 86400000 }))
+    .filter((o) => o.d >= -7 && o.d <= 28);
+  const lead = clamp(soonSig.length ? 1 - Math.min(...soonSig.map((o) => o.d)) / 28 : 0, 0, 1);
+
+  const score =
+    w.demand * demand +
+    w.whitespace * whitespace +
+    w.corner * corner +
+    w.lead * lead +
+    w.feas * feas +
+    w.stock * stock -
+    w.risk * risk;
+
+  return { score: clamp(score, 0, 1), parts: { demand, whitespace, corner, lead, feas, stock, risk } };
+}
+
+// ---------- UI Components ----------
+
+function Section({ title, icon: Icon = Sparkles, actions, children }) {
+  return (
+    <div className="mb-6">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Icon className="w-5 h-5" />
+          <h2 className="text-lg font-semibold">{title}</h2>
+        </div>
+        <div className="flex items-center gap-2">{actions}</div>
+      </div>
+      <div className="bg-white/5 border border-white/10 rounded-2xl p-4 shadow-sm">{children}</div>
+    </div>
+  );
+}
+
+function StatCard({ label, value, sub, icon: Icon = Activity }) {
+  return (
+    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 flex items-center gap-3">
+      <div className="rounded-xl bg-white/10 p-2"><Icon className="w-5 h-5" /></div>
+      <div>
+        <div className="text-sm text-white/70">{label}</div>
+        <div className="text-xl font-bold">{value}</div>
+        {sub && <div className="text-xs text-white/60 mt-0.5">{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+function Badge({ children, tone = "default" }) {
+  const map = {
+    default: "bg-white/10 text-white",
+    success: "bg-emerald-500/20 text-emerald-200",
+    warn: "bg-amber-500/20 text-amber-100",
+    danger: "bg-rose-500/20 text-rose-100",
+    info: "bg-sky-500/20 text-sky-100",
+  };
+  return <span className={`px-2 py-1 rounded-lg text-xs ${map[tone]}`}>{children}</span>;
+}
+
+function Pill({ children }) {
+  return <span className="px-2 py-1 rounded-full bg-white/10 text-xs">{children}</span>;
+}
+
+function Table({ columns, rows, keyField = "id", onRowClick }) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr className="text-left text-white/70 border-b border-white/10">
+            {columns.map((c) => (
+              <th key={c.key} className="py-2 pr-4 font-medium">{c.label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r[keyField]} className="border-b border-white/5 hover:bg-white/5 cursor-pointer" onClick={() => onRowClick && onRowClick(r)}>
+              {columns.map((c) => (
+                <td key={c.key} className="py-2 pr-4">{c.render ? c.render(r[c.key], r) : r[c.key]}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function HeatmapGrid({ data }) {
+  // data: [{area, weekISO, index}]
+  const weeks = [...new Set(data.map((d) => d.weekISO))].sort();
+  const areas = [...new Set(data.map((d) => d.area))];
+  return (
+    <div className="overflow-x-auto">
+      <table className="text-xs">
+        <thead>
+          <tr>
+            <th className="text-left pr-2">エリア</th>
+            {weeks.map((w) => (
+              <th key={w} className="px-1 text-center text-white/60">{w.slice(5)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {areas.map((a) => (
+            <tr key={a}>
+              <td className="pr-2 font-medium">{a}</td>
+              {weeks.map((w) => {
+                const cell = data.find((d) => d.area === a && d.weekISO === w);
+                const v = cell ? cell.index : 0;
+                const bg = `hsl(${clamp(120 - v, 0, 120)},70%,${30 + v * 0.3}%)`;
+                return (
+                  <td key={w} title={`${a} ${w}: S=${v}`} className="w-8 h-6">
+                    <div className="w-8 h-6 rounded" style={{ backgroundColor: bg }} />
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function Modal({ open, onClose, title, children }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/60" onClick={onClose} />
+      <div className="relative w-full max-w-3xl bg-neutral-900 border border-white/10 rounded-2xl p-5 shadow-xl">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-lg font-semibold">{title}</h3>
+          <button onClick={onClose} className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20">閉じる</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Main App ----------
+
+export default function SalesOpsPortal() {
+  const [weights, setWeights] = useState/** @type {[Weights, any]} */(
+    () => Storage.load("weights", DEFAULT_WEIGHTS)
+  );
+  const [signals, setSignals] = useState/** @type {[Signal[], any]} */(
+    () => Storage.load("signals", MOCK_SIGNALS)
+  );
+  const [locations, setLocations] = useState/** @type {[Location[], any]} */(
+    () => Storage.load("locations", MOCK_LOCATIONS)
+  );
+  const [season, setSeason] = useState/** @type {[SeasonalityIndex[], any]} */(
+    () => Storage.load("season", MOCK_SEASON)
+  );
+  const [deals, setDeals] = useState/** @type {[Deal[], any]} */(
+    () => Storage.load("deals", [])
+  );
+  const [experiments, setExperiments] = useState/** @type {[Experiment[], any]} */(
+    () => Storage.load("experiments", [])
+  );
+
+  const [tab, setTab] = useState("dashboard");
+  const [query, setQuery] = useState("");
+  const [selectedArea, setSelectedArea] = useState("すべて");
+  const [dealModal, setDealModal] = useState/** @type {[Deal|null, any]} */(null);
+  const [signalModal, setSignalModal] = useState/** @type {[Signal|null, any]} */(null);
+
+  useEffect(() => Storage.save("weights", weights), [weights]);
+  useEffect(() => Storage.save("signals", signals), [signals]);
+  useEffect(() => Storage.save("locations", locations), [locations]);
+  useEffect(() => Storage.save("season", season), [season]);
+  useEffect(() => Storage.save("deals", deals), [deals]);
+  useEffect(() => Storage.save("experiments", experiments), [experiments]);
+
+  const scored = useMemo(() => {
+    return locations.map((loc) => {
+      const r = computePriority(loc, season, signals, weights);
+      return { ...loc, priority: r.score, parts: r.parts };
+    }).sort((a, b) => b.priority - a.priority);
+  }, [locations, season, signals, weights]);
+
+  const alerts = useMemo(() => {
+    const now = todayISO();
+    const items = [];
+    for (const s of signals) {
+      const days = Math.round((new Date(s.deadline) - new Date(now)) / 86400000);
+      if (days <= 14) items.push({ level: days < 0 ? "danger" : days <= 7 ? "warn" : "info", text: `シグナル期限: ${s.title}（${s.area}）T${days>=0?"-":"+"}${Math.abs(days)}日` });
+    }
+    for (const d of deals) {
+      const days = Math.round((new Date(d.sla.liveBy) - new Date(now)) / 86400000);
+      if (days <= 21 && d.stage !== "live") items.push({ level: days < 0 ? "danger" : "warn", text: `稼働SLA逼迫: ${d.id}（${d.stage}）残り${days}日` });
+    }
+    return items.slice(0, 6);
+  }, [signals, deals]);
+
+  const stock = { available: 6, capacity: 14, waitlist: 5 }; // MVP constants
+
+  const filteredSignals = useMemo(() => {
+    return signals.filter((s) => (selectedArea === "すべて" || s.area === selectedArea) && (s.title.includes(query) || s.source.includes(query)));
+  }, [signals, query, selectedArea]);
+
+  const filteredPriority = useMemo(() => {
+    return scored.filter((l) => (selectedArea === "すべて" || l.area === selectedArea) && (l.name.includes(query) || l.chain.includes(query)));
+  }, [scored, query, selectedArea]);
+
+  function createDealFromSignal(signal, locationId) {
+    const id = `D-${Date.now()}`;
+    const targetLive = signal.endAt > todayISO() ? signal.startAt : addDaysISO(todayISO(), 30);
+    const newDeal /** @type {Deal} */ = {
+      id, locationId, stage: "prospect", targetLiveAt: targetLive, capex: 1800000, roiEst: 12,
+      sla: {
+        contactBy: addDaysISO(todayISO(), 7),
+        approvalBy: addDaysISO(todayISO(), 21),
+        constructBy: addDaysISO(todayISO(), 35),
+        liveBy: addDaysISO(todayISO(), 45),
+      },
+      notes: `Signal linkage: ${signal.title}\nRecommended: ${signal.recommended.join(", ")}`,
+      createdAt: todayISO(),
+      signalId: signal.id,
+    };
+    setDeals((ds) => [newDeal, ...ds]);
+  }
+
+  function updateDealStage(deal, stage /** @type {DealStage} */) {
+    setDeals((ds) => ds.map((d) => (d.id === deal.id ? { ...d, stage } : d)));
+  }
+
+  function resetAll() {
+    if (!confirm("全データを初期のモックに戻します。よろしいですか？")) return;
+    setSignals(MOCK_SIGNALS);
+    setLocations(MOCK_LOCATIONS);
+    setSeason(MOCK_SEASON);
+    setDeals([]);
+    setExperiments([]);
+    setWeights(DEFAULT_WEIGHTS);
+  }
+
+  // ---------- Render ----------
+
+  return (
+    <div className="min-h-screen text-white bg-gradient-to-b from-neutral-900 to-black">
+      <header className="sticky top-0 z-40 backdrop-blur bg-black/30 border-b border-white/10">
+        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-4">
+          <Rocket className="w-5 h-5" />
+          <h1 className="font-bold tracking-tight">Sales Ops Portal — News × Seasonality OS</h1>
+          <div className="flex-1" />
+          <nav className="hidden md:flex items-center gap-2 text-sm">
+            {[
+              ["dashboard", "ダッシュボード", <BarChart3 key="i" className="w-4 h-4" />],
+              ["map", "マップ×カレンダー", <MapIcon key="i" className="w-4 h-4" />],
+              ["signals", "シグナル", <LibraryBig key="i" className="w-4 h-4" />],
+              ["priority", "優先度", <Target key="i" className="w-4 h-4" />],
+              ["deals", "案件", <ClipboardCheck key="i" className="w-4 h-4" />],
+              ["experiments", "検証", <Activity key="i" className="w-4 h-4" />],
+              ["admin", "管理", <Settings key="i" className="w-4 h-4" />],
+            ].map(([k, label, ic]) => (
+              <button key={k} onClick={() => setTab(String(k))} className={`px-3 py-1.5 rounded-xl hover:bg-white/10 flex items-center gap-1 ${tab===k?"bg-white/10":""}`}>
+                {ic}<span>{label}</span>
+              </button>
+            ))}
+          </nav>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 py-6">
+        {/* Global filters */}
+        <div className="flex flex-col md:flex-row gap-3 mb-4">
+          <div className="flex items-center gap-2 flex-1">
+            <Filter className="w-4 h-4" />
+            <input value={query} onChange={(e)=>setQuery(e.target.value)} placeholder="検索（施設名/チェーン/シグナル）" className="w-full px-3 py-2 rounded-xl bg-white/10 focus:outline-none" />
+          </div>
+          <div className="flex items-center gap-2">
+            <Globe2 className="w-4 h-4" />
+            <select value={selectedArea} onChange={(e)=>setSelectedArea(e.target.value)} className="px-3 py-2 rounded-xl bg-white/10">
+              {["すべて", ...AREAS].map((a)=> <option key={a} value={a}>{a}</option>)}
+            </select>
+          </div>
+          <button onClick={resetAll} className="px-3 py-2 rounded-xl bg-rose-600/80 hover:bg-rose-600 flex items-center gap-2"><RefreshCw className="w-4 h-4"/>リセット</button>
+        </div>
+
+        {tab === "dashboard" && (
+          <div>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
+              <StatCard label="今週の重要シグナル" value={signals.length} sub="信頼度0.7+" icon={Bell} />
+              <StatCard label="優先度Top20の平均" value={(filteredPriority.slice(0,20).reduce((s,x)=>s+x.priority,0)/Math.max(1,Math.min(20,filteredPriority.length))).toFixed(2)} sub="需要×角×SLA" icon={TrendingUp} />
+              <StatCard label="在庫(出庫可能)" value={stock.available} sub="今月の施工枠: 14" icon={BadgeCheck} />
+              <StatCard label="アラート" value={alerts.length} sub="期限/稼働SLA/効果鈍化" icon={AlertTriangle} />
+            </div>
+
+            <Section title="アラート / リスク" icon={AlertTriangle} actions={<Pill>JST {todayISO()}</Pill>}>
+              {alerts.length === 0 ? (
+                <div className="text-white/70">現在、重大なアラートはありません。</div>
+              ) : (
+                <ul className="grid md:grid-cols-2 gap-2">
+                  {alerts.map((a, i) => (
+                    <li key={i} className="flex items-center gap-2 p-2 rounded-xl bg-white/5 border border-white/10">
+                      <span>{a.level === "danger" ? <AlertTriangle className="w-4 h-4 text-rose-300"/> : a.level === "warn" ? <AlertTriangle className="w-4 h-4 text-amber-200"/> : <Bell className="w-4 h-4 text-sky-200"/>}</span>
+                      <span>{a.text}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Section>
+
+            <Section title="週次ヒートマップ（需要指数S）" icon={BarChart3}>
+              <HeatmapGrid data={season} />
+            </Section>
+
+            <Section title="優先度ランキング Top 20" icon={Target} actions={<Pill>角（横展開）× 白地 × 需要</Pill>}>
+              <Table
+                columns={[
+                  { key: "name", label: "地点" },
+                  { key: "area", label: "エリア" },
+                  { key: "chain", label: "チェーン" },
+                  { key: "priority", label: "Score", render: (v, r) => <span className="font-semibold">{v.toFixed(2)}</span> },
+                  { key: "parts", label: "要素", render: (v, r) => (
+                    <div className="flex flex-wrap gap-1">
+                      <Badge tone="info">需要 {fmtPct(v.demand)}</Badge>
+                      <Badge>白地 {fmtPct(v.whitespace)}</Badge>
+                      <Badge>角 {fmtPct(v.corner)}</Badge>
+                      <Badge tone="warn">期限 {fmtPct(v.lead)}</Badge>
+                      <Badge>施工 {fmtPct(v.feas)}</Badge>
+                      <Badge>在庫 {fmtPct(v.stock)}</Badge>
+                      <Badge tone="danger">リスク {fmtPct(v.risk)}</Badge>
+                    </div>
+                  ) },
+                ]}
+                rows={filteredPriority.slice(0, 20)}
+                onRowClick={(r)=>{
+                  const linkedDeals = deals.filter((d)=>d.locationId===r.id);
+                  const msg = linkedDeals.length ? `関連案件: \n${linkedDeals.map(d=>`${d.id} (${d.stage})`).join("\n")}` : "関連案件なし";
+                  alert(`${r.name} — Score ${r.priority.toFixed(2)}\n${msg}`);
+                }}
+              />
+            </Section>
+          </div>
+        )}
+
+        {tab === "map" && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <Section title="カレンダー" icon={CalendarIcon}>
+              <ul className="space-y-2 text-sm">
+                {signals
+                  .slice()
+                  .sort((a,b)=> new Date(a.startAt) - new Date(b.startAt))
+                  .map((s)=> (
+                    <li key={s.id} className="p-2 rounded-xl bg-white/5 border border-white/10">
+                      <div className="flex items-center justify-between">
+                        <div className="font-medium">{s.title}</div>
+                        <Badge tone="info">{s.type}</Badge>
+                      </div>
+                      <div className="text-white/70">{s.area}｜{s.startAt} → {s.endAt}｜Δタッチ~{s.deltaTouch}</div>
+                      <div className="mt-2 flex items-center gap-2">
+                        <button onClick={()=>setSignalModal(s)} className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-xs">詳細</button>
+                        <button onClick={()=>createDealFromSignal(s, locations[0].id)} className="px-2 py-1 rounded-lg bg-emerald-600/80 hover:bg-emerald-600 text-xs">このシグナルで起案</button>
+                      </div>
+                    </li>
+                  ))}
+              </ul>
+            </Section>
+            <div className="md:col-span-2">
+              <Section title="マップ（簡易スキャッタ）" icon={MapIcon} actions={<Pill>範囲：日本</Pill>}>
+                <div className="w-full h-[420px] relative rounded-2xl bg-gradient-to-b from-slate-900 to-slate-950 border border-white/10 overflow-hidden">
+                  {locations.map((l)=>{
+                    const { x, y } = projectXY(l.lat, l.lng, 900, 420);
+                    const pr = scored.find((s)=>s.id===l.id)?.priority ?? 0.2;
+                    const size = 8 + pr * 16;
+                    return (
+                      <div key={l.id} title={`${l.name} (${l.area}) Score ${pr.toFixed(2)}`}
+                        className="absolute -translate-x-1/2 -translate-y-1/2"
+                        style={{ left: `${x/900*100}%`, top: `${y/420*100}%` }}
+                        onClick={()=> alert(`${l.name}\nScore ${pr.toFixed(2)}`)}
+                      >
+                        <div className="rounded-full bg-emerald-400/30 border border-emerald-300/40" style={{ width: size, height: size }} />
+                      </div>
+                    );
+                  })}
+                  <div className="absolute bottom-2 right-2 text-xs text-white/60">※デモ用の簡易プロジェクション</div>
+                </div>
+              </Section>
+            </div>
+          </div>
+        )}
+
+        {tab === "signals" && (
+          <div>
+            <Section title="シグナルInbox" icon={LibraryBig} actions={<Badge tone="info">{filteredSignals.length} 件</Badge>}>
+              <Table
+                columns={[
+                  { key: "title", label: "タイトル" },
+                  { key: "area", label: "エリア" },
+                  { key: "type", label: "種別" },
+                  { key: "startAt", label: "開始" },
+                  { key: "endAt", label: "終了" },
+                  { key: "deadline", label: "期限" },
+                  { key: "deltaTouch", label: "Δタッチ" },
+                  { key: "trust", label: "信頼度", render: (v) => fmtPct(v) },
+                ]}
+                rows={filteredSignals}
+                onRowClick={(r)=> setSignalModal(r)}
+              />
+            </Section>
+          </div>
+        )}
+
+        {tab === "priority" && (
+          <div>
+            <Section title="優先度ランキング" icon={Target} actions={<Badge>{filteredPriority.length} 地点</Badge>}>
+              <Table
+                columns={[
+                  { key: "name", label: "地点" },
+                  { key: "area", label: "エリア" },
+                  { key: "chain", label: "チェーン" },
+                  { key: "priority", label: "Score", render: (v) => <span className="font-semibold">{v.toFixed(2)}</span> },
+                  { key: "parts", label: "要素", render: (v) => (
+                    <div className="flex flex-wrap gap-1">
+                      <Badge tone="info">需要 {fmtPct(v.demand)}</Badge>
+                      <Badge>白地 {fmtPct(v.whitespace)}</Badge>
+                      <Badge>角 {fmtPct(v.corner)}</Badge>
+                      <Badge tone="warn">期限 {fmtPct(v.lead)}</Badge>
+                      <Badge>施工 {fmtPct(v.feas)}</Badge>
+                      <Badge>在庫 {fmtPct(v.stock)}</Badge>
+                      <Badge tone="danger">リスク {fmtPct(v.risk)}</Badge>
+                    </div>
+                  ) },
+                ]}
+                rows={filteredPriority}
+                onRowClick={(r)=>{
+                  if (confirm(`${r.name} を案件化しますか？`)) {
+                    const fakeSig = signals[0];
+                    createDealFromSignal(fakeSig, r.id);
+                    setTab("deals");
+                  }
+                }}
+              />
+            </Section>
+          </div>
+        )}
+
+        {tab === "deals" && (
+          <div>
+            <Section title="案件一覧" icon={ClipboardCheck} actions={<Badge tone="info">{deals.length} 件</Badge>}>
+              <Table
+                columns={[
+                  { key: "id", label: "案件ID" },
+                  { key: "locationId", label: "地点", render: (v)=> locations.find((l)=>l.id===v)?.name || v },
+                  { key: "stage", label: "ステージ", render: (v)=> <Badge tone={v==="live"?"success": v==="installing"?"info":"default"}>{v}</Badge> },
+                  { key: "targetLiveAt", label: "稼働目標" },
+                  { key: "roiEst", label: "回収(月)" },
+                ]}
+                rows={deals}
+                onRowClick={(r)=> setDealModal(r)}
+              />
+            </Section>
+          </div>
+        )}
+
+        {tab === "experiments" && (
+          <div>
+            <Section title="検証ログ" icon={Activity}>
+              <div className="grid md:grid-cols-2 gap-4">
+                <form onSubmit={(e)=>{ e.preventDefault();
+                  const fd = new FormData(e.currentTarget);
+                  const ex = /** @type {Experiment} */({
+                    id: `E-${Date.now()}`,
+                    design: fd.get("design"),
+                    name: String(fd.get("name")),
+                    startAt: String(fd.get("startAt")),
+                    endAt: String(fd.get("endAt")),
+                    groups: String(fd.get("groups")),
+                    metric: String(fd.get("metric")),
+                    minDetectableEffect: Number(fd.get("mde")),
+                  });
+                  setExperiments((xs)=> [ex, ...xs]);
+                  e.currentTarget.reset();
+                }} className="bg-white/5 border border-white/10 rounded-2xl p-4">
+                  <div className="font-semibold mb-2">新規登録</div>
+                  <div className="grid grid-cols-2 gap-2 text-sm">
+                    <label className="col-span-2">名称<input name="name" required className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
+                    <label>デザイン<select name="design" className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"><option value="stepwedge">ステップウェッジ</option><option value="did">差分の差分</option><option value="synth">合成対照</option></select></label>
+                    <label>指標<input name="metric" defaultValue="タッチ数" className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
+                    <label>開始<input type="date" name="startAt" defaultValue={todayISO()} className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
+                    <label>終了<input type="date" name="endAt" defaultValue={addDaysISO(todayISO(), 28)} className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
+                    <label className="col-span-2">群設定<textarea name="groups" placeholder="例）関西=導入, 関東=対照（週ズラし）" className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
+                    <label>MDE<input type="number" step="1" name="mde" defaultValue={10} className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
+                    <div className="col-span-2 flex justify-end"><button className="px-3 py-2 rounded-xl bg-emerald-600/80 hover:bg-emerald-600">登録</button></div>
+                  </div>
+                </form>
+                <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
+                  <div className="font-semibold mb-2">一覧</div>
+                  <ul className="space-y-2 text-sm">
+                    {experiments.map((x)=> (
+                      <li key={x.id} className="p-2 rounded-xl bg-white/5 border border-white/10">
+                        <div className="flex items-center justify-between"><div className="font-medium">{x.name}</div><Badge tone="info">{x.design}</Badge></div>
+                        <div className="text-white/70">{x.startAt} → {x.endAt}｜MDE≈{x.minDetectableEffect}%｜指標:{x.metric}</div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </Section>
+          </div>
+        )}
+
+        {tab === "admin" && (
+          <div className="grid md:grid-cols-2 gap-4">
+            <Section title="重み（優先度スコア）" icon={Settings}>
+              <div className="grid grid-cols-2 gap-2 text-sm">
+                {Object.entries(weights).map(([k,v])=> (
+                  <label key={k} className="flex items-center gap-2">{k}
+                    <input type="range" min={0} max={0.5} step={0.01} value={v}
+                      onChange={(e)=> setWeights((w)=> ({ ...w, [k]: Number(e.target.value) }))}
+                      className="flex-1"/>
+                    <span className="w-12 text-right">{Number(v).toFixed(2)}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="text-xs text-white/60 mt-2">※ 合計1.3でも動きます（リスクは減点）。運用で調整してください。</div>
+            </Section>
+            <Section title="辞書/初期データ" icon={LibraryBig}>
+              <div className="text-sm space-y-2">
+                <div>エリア: {AREAS.join(", ")}</div>
+                <div>チェーン規約（例）: コンビニ=全店一斉 / ホテル=客室・EV掲出可（要許諾）</div>
+                <div className="flex gap-2 mt-2">
+                  <button onClick={()=>{
+                    const s = prompt("手動シグナル追加（タイトル）");
+                    if (!s) return;
+                    setSignals((arr)=> [{ id:`S-${Date.now()}`, type:"event", title:s, source:"Manual", trust:.7, area:"東京", startAt: todayISO(), endAt: addDaysISO(todayISO(), 7), deadline: addDaysISO(todayISO(), 3), deltaTouch: 50, recommended:["MEO更新"] }, ...arr]);
+                  }} className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20">シグナル追加</button>
+                  <button onClick={resetAll} className="px-3 py-2 rounded-xl bg-rose-600/80 hover:bg-rose-600">全リセット</button>
+                </div>
+              </div>
+            </Section>
+          </div>
+        )}
+      </main>
+
+      {/* Signal Modal */}
+      <Modal open={!!signalModal} onClose={()=> setSignalModal(null)} title={signalModal?.title || ""}>
+        {signalModal && (
+          <div className="space-y-2 text-sm">
+            <div className="flex flex-wrap gap-2">
+              <Badge tone="info">{signalModal.type}</Badge>
+              <Badge>{signalModal.area}</Badge>
+              <Badge>Δタッチ~{signalModal.deltaTouch}</Badge>
+              <Badge tone={signalModal.trust>0.85?"success":"default"}>信頼度 {fmtPct(signalModal.trust)}</Badge>
+            </div>
+            <div className="text-white/70">期間: {signalModal.startAt} → {signalModal.endAt}</div>
+            <div className="text-white/70">期限: {signalModal.deadline}</div>
+            <div className="">推奨: {signalModal.recommended.join("、 ")}</div>
+            <div className="mt-3">
+              <label className="block mb-1">案件化する地点</label>
+              <select id="dealLoc" className="w-full px-3 py-2 rounded-xl bg-white/10">
+                {locations.map((l)=> <option key={l.id} value={l.id}>{l.name}（{l.area}）</option>)}
+              </select>
+              <div className="flex justify-end gap-2 mt-2">
+                <button onClick={()=>{
+                  const sel = document.getElementById("dealLoc");
+                  const locId = sel ? (sel /** @type {HTMLSelectElement} */).value : locations[0].id;
+                  createDealFromSignal(signalModal, locId);
+                  setSignalModal(null);
+                  setTab("deals");
+                }} className="px-3 py-2 rounded-xl bg-emerald-600/80 hover:bg-emerald-600">案件化</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Deal Modal */}
+      <Modal open={!!dealModal} onClose={()=> setDealModal(null)} title={dealModal ? `${dealModal.id} 詳細` : ""}>
+        {dealModal && (
+          <div className="space-y-3 text-sm">
+            <div className="flex flex-wrap gap-2">
+              <Badge tone={dealModal.stage==="live"?"success":dealModal.stage==="installing"?"info":"default"}>{dealModal.stage}</Badge>
+              <Badge>{locations.find((l)=>l.id===dealModal.locationId)?.name}</Badge>
+            </div>
+            <div>稼働目標: <b>{dealModal.targetLiveAt}</b></div>
+            <div>ROI目安: {dealModal.roiEst} ヶ月 / CAPEX: ¥{fmt.format(dealModal.capex)}</div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="bg-white/5 rounded-xl p-2">連絡期限: {dealModal.sla.contactBy}</div>
+              <div className="bg-white/5 rounded-xl p-2">承認期限: {dealModal.sla.approvalBy}</div>
+              <div className="bg-white/5 rounded-xl p-2">施工期限: {dealModal.sla.constructBy}</div>
+              <div className="bg-white/5 rounded-xl p-2">稼働期限: {dealModal.sla.liveBy}</div>
+            </div>
+            <div className="bg-white/5 rounded-xl p-2 whitespace-pre-wrap">{dealModal.notes}</div>
+            <div className="flex items-center gap-2">
+              {(["prospect","negotiation","approved","installing","live"]).map((st)=> (
+                <button key={st} onClick={()=> updateDealStage(dealModal, /** @type {DealStage} */(st))} className={`px-2 py-1 rounded-xl ${dealModal.stage===st?"bg-white/20":"bg-white/10 hover:bg-white/20"}`}>{st}</button>
+              ))}
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <footer className="max-w-7xl mx-auto px-4 py-10 text-xs text-white/50">
+        <div>© Sales Ops Portal — Demo. Single-file MVP. Replace mocks with real data sources for production.</div>
+      </footer>
+    </div>
+  );
+}
