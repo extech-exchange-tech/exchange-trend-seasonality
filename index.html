@@ -1,801 +1,614 @@
-/*
-  Sales Ops Portal — News × Seasonality OS (MVP, single-file React)
-  ---------------------------------------------------------------
-  Purpose:
-    Internal portal to convert "news × seasonality" signals into concrete sales actions
-    (prioritization, deal creation, SLA tracking, and basic experiment logging).
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>重要度スコア・シグナルビューア</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Noto Sans JP Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+    
+    <style>
+        /* フォント設定 */
+        body {
+            font-family: 'Noto Sans JP', sans-serif;
+            background-color: #f8fafc; /* Tailwind bg-gray-50 */
+        }
 
-  Notes:
-    - Single-file React component suitable for ChatGPT canvas preview.
-    - Uses Tailwind (available globally), lucide-react for icons, recharts for charts.
-    - No backend: data persists to localStorage for demo; swap Storage API to plug in real DB.
-    - Includes:
-        • Dashboard (Top Signals / Priority Top 20 / Heatmap / Alerts / Stock & Capacity)
-        • Map × Calendar (simple SVG scatter map + calendar list)
-        • Signal Inbox (filterable; one-click to create Deal)
-        • Priority Ranking (sortable table; formula with tunable weights)
-        • Deals (detail modal; SLA, target live date, chain playbook hints)
-        • Experiments (step‑wedge / DiD template capture; tie to KPI = touches)
-        • Admin (weights, dictionaries, seed/reset)
+        /* ローディングスピナー */
+        .loader {
+            border: 4px solid #f3f3f3; /* Light grey */
+            border-top: 4px solid #3b82f6; /* Blue 500 */
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        /* 概要表示エリア用のスタイル */
+        .summary-content {
+            display: none; /* 初期状態は非表示 */
+            border-top: 1px solid #e5e7eb; /* 境界線 */
+            padding-top: 12px;
+            margin-top: 12px;
+        }
+    </style>
+</head>
+<body class="antialiased">
 
-  How to extend:
-    - Replace MOCK_DATA + Storage with API calls.
-    - Connect real JNTO / visas / cruise schedules / opening news via ETL (RSS, CSV, manual upload).
-    - Add RBAC via SSO and route-level guards when moving to full app framework (Next.js etc.).
-*/
+    <div class="container mx-auto p-4 md:p-8 max-w-4xl">
+        <header class="mb-6">
+            <h1 class="text-2xl md:text-3xl font-bold text-gray-800">
+                重要度スコア・シグナルビューア
+            </h1>
+            <!-- <p>...</p> の説明文を削除 -->
+        </header>
 
-import React, { useEffect, useMemo, useState } from "react";
-import { motion } from "framer-motion";
-import {
-  Activity,
-  AlertTriangle,
-  Anchor,
-  BadgeCheck,
-  BarChart3,
-  Bell,
-  Building2,
-  Calendar as CalendarIcon,
-  CheckCircle2,
-  ChevronDown,
-  ClipboardCheck,
-  Compass,
-  Filter,
-  Globe2,
-  LibraryBig,
-  Loader2,
-  Map as MapIcon,
-  Plane,
-  RefreshCw,
-  Rocket,
-  Settings,
-  Ship,
-  Sparkles,
-  Target,
-  TrendingUp,
-} from "lucide-react";
-import {
-  ResponsiveContainer,
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  BarChart,
-  Bar,
-} from "recharts";
-
-// ---------- Types ----------
-
-/** @typedef {"event"|"visa"|"route"|"cruise"|"population"|"weather"|"opening"|"chain"|"forecast"} SignalType */
-/** @typedef {"hotel"|"convenience"|"donki"|"mall"|"station"|"airport"|"port"|"tourist"} LocationType */
-/** @typedef {"prospect"|"negotiation"|"approved"|"installing"|"live"} DealStage */
-
-/** @typedef {{
- *  id: string; type: SignalType; title: string; source: string; trust: number; // 0..1
- *  area: string; lat?: number; lng?: number;
- *  startAt: string; endAt: string; deadline: string;
- *  deltaTouch: number; // expected uplift/day at peak
- *  recommended: string[];
- * }} Signal */
-
-/** @typedef {{ area: string; weekISO: string; index: number; tags: string[] }} SeasonalityIndex */
-
-/** @typedef {{
- *  id: string; name: string; chain: string; type: LocationType; area: string;
- *  lat: number; lng: number; installability: number; // 0..1
- *  power: boolean; line: boolean; whitespace: number; // 0..1
- *  corner: number; // 0..1 "Othello corner" horizontal expansion potential
- *  risk: number; // 0..1 higher = riskier
- * }} Location */
-
-/** @typedef {{
- *  id: string; locationId: string; stage: DealStage; targetLiveAt: string; capex: number; roiEst: number;
- *  sla: { contactBy: string; approvalBy: string; constructBy: string; liveBy: string };
- *  notes: string; createdAt: string; signalId?: string;
- * }} Deal */
-
-/** @typedef {{
- *  id: string; design: "stepwedge"|"did"|"synth"; name: string; startAt: string; endAt: string;
- *  groups: string; metric: string; minDetectableEffect: number; significant?: boolean;
- * }} Experiment */
-
-/** @typedef {{ demand: number; whitespace: number; corner: number; lead: number; feas: number; stock: number; risk: number }} Weights */
-
-// ---------- Utilities ----------
-
-const fmt = new Intl.NumberFormat("ja-JP");
-const fmtPct = (v) => `${Math.round(v * 100)}%`;
-const todayISO = () => new Date().toISOString().slice(0, 10);
-const addDaysISO = (iso, d) => new Date(new Date(iso).getTime() + d * 86400000).toISOString().slice(0, 10);
-const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
-
-// Projected Japan-ish bounds for quick scatter (no basemap)
-const JAPAN_BOUNDS = { latMin: 24, latMax: 45.5, lngMin: 123.5, lngMax: 146.5 };
-const projectXY = (lat, lng, w, h) => {
-  const x = ((lng - JAPAN_BOUNDS.lngMin) / (JAPAN_BOUNDS.lngMax - JAPAN_BOUNDS.lngMin)) * w;
-  const y = (1 - (lat - JAPAN_BOUNDS.latMin) / (JAPAN_BOUNDS.latMax - JAPAN_BOUNDS.latMin)) * h;
-  return { x, y };
-};
-
-// ---------- Mock & Storage ----------
-
-const Storage = {
-  load(key, fallback) {
-    try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
-  },
-  save(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} },
-};
-
-const AREAS = ["東京", "大阪", "京都", "白馬", "日光", "横浜", "那覇", "札幌"];
-
-const MOCK_LOCATIONS /** @type {Location[]} */ = [
-  { id: "L-TYO-DONKI-GINZA", name: "ドン・キホーテ 銀座本館", chain: "DonKi", type: "donki", area: "東京", lat: 35.671, lng: 139.765, installability: .9, power: true, line: true, whitespace: .4, corner: .9, risk: .2 },
-  { id: "L-OSK-DONKI-DOTON", name: "ドン・キホーテ 道頓堀店", chain: "DonKi", type: "donki", area: "大阪", lat: 34.668, lng: 135.501, installability: .9, power: true, line: true, whitespace: .5, corner: .85, risk: .25 },
-  { id: "L-TYO-APA-SHINJ", name: "アパホテル 新宿", chain: "APA", type: "hotel", area: "東京", lat: 35.693, lng: 139.703, installability: .8, power: true, line: true, whitespace: .6, corner: .6, risk: .2 },
-  { id: "L-KYT-HOTEL-GION", name: "HMJ 京都 祇園", chain: "HMJ", type: "hotel", area: "京都", lat: 35.003, lng: 135.778, installability: .85, power: true, line: true, whitespace: .5, corner: .6, risk: .2 },
-  { id: "L-HKB-SKI-BASE", name: "白馬ゴンドラベース", chain: "Resort", type: "tourist", area: "白馬", lat: 36.699, lng: 137.861, installability: .7, power: true, line: false, whitespace: .8, corner: .7, risk: .35 },
-  { id: "L-NKK-TEMPLE-GATE", name: "日光 東照宮 表参道", chain: "Tourism", type: "tourist", area: "日光", lat: 36.757, lng: 139.598, installability: .6, power: true, line: false, whitespace: .7, corner: .65, risk: .3 },
-  { id: "L-YKH-PIER", name: "横浜大さん橋ターミナル", chain: "Port", type: "port", area: "横浜", lat: 35.446, lng: 139.653, installability: .9, power: true, line: true, whitespace: .5, corner: .75, risk: .2 },
-  { id: "L-NHA-KOKUSAI", name: "那覇クルーズターミナル", chain: "Port", type: "port", area: "那覇", lat: 26.214, lng: 127.673, installability: .85, power: true, line: true, whitespace: .55, corner: .7, risk: .25 },
-];
-
-const MOCK_SIGNALS /** @type {Signal[]} */ = [
-  { id: "S-EXPO2025", type: "event", title: "大阪・関西万博 会期", source: "Expo calendar", trust: 0.95, area: "大阪", startAt: "2025-04-13", endAt: "2025-10-13", deadline: "2025-01-15", deltaTouch: 260, recommended: ["万博国別デー言語対応", "梅田・難波・空港導線厚め"] },
-  { id: "S-YKH-CRUISE-1120", type: "cruise", title: "クルーズ大型船 横浜寄港(3,200名)", source: "Port schedule", trust: 0.9, area: "横浜", lat: 35.446, lng: 139.653, startAt: addDaysISO(todayISO(), 14), endAt: addDaysISO(todayISO(), 14), deadline: addDaysISO(todayISO(), 7), deltaTouch: 180, recommended: ["大さん橋〜山下公園導線掲出", "臨時増設1台"] },
-  { id: "S-VISA-TH-EXT", type: "visa", title: "タイ観光ビザ政策の緩和動向", source: "MOFA/JNTO", trust: 0.8, area: "東京", startAt: todayISO(), endAt: addDaysISO(todayISO(), 60), deadline: addDaysISO(todayISO(), 10), deltaTouch: 60, recommended: ["多言語(TH)MEO更新", "浅草/秋葉原のピン最適化"] },
-  { id: "S-SKI-HAKUBA", type: "forecast", title: "白馬スキー需要指数↑ (12-3月)", source: "Seasonality model", trust: 0.85, area: "白馬", startAt: "2025-12-01", endAt: "2026-03-31", deadline: "2025-10-15", deltaTouch: 140, recommended: ["8-10月に商談/工事確定", "ゴンドラ乗り場周辺を角指定"] },
-  { id: "S-OPEN-HOTEL-KYOTO", type: "opening", title: "京都 祇園エリア 新設ホテル(来春OP)情報", source: "Press", trust: 0.7, area: "京都", startAt: "2026-03-15", endAt: "2026-03-15", deadline: "2025-11-30", deltaTouch: 90, recommended: ["T-6ヶ月一次接触", "客室/EV掲出テンプレ配布"] },
-  { id: "S-POP-MATSUDO", type: "population", title: "松戸：在住外国人増勢（留学/就労）", source: "Municipal stats", trust: 0.8, area: "東京", startAt: todayISO(), endAt: addDaysISO(todayISO(), 365), deadline: addDaysISO(todayISO(), 20), deltaTouch: 40, recommended: ["行政/銀行/携帯ショップ導線の常設厚め"] },
-];
-
-const MOCK_SEASON /** @type {SeasonalityIndex[]} */ = (() => {
-  const weeks = 12; // display horizon
-  const out = [];
-  for (const area of AREAS) {
-    for (let w = 0; w < weeks; w++) {
-      const base = 40 + Math.random() * 40;
-      const bump = (area === "日光" && (w === 2 || w === 3)) ? 35 : 0; //紅葉
-      const ski = (area === "白馬" && (w >= 8)) ? 30 : 0; //冬近づくと上昇
-      const expo = (area === "大阪" && (w >= 4 && w <= 10)) ? 20 : 0; //会期近傍
-      out.push({ area, weekISO: addDaysISO(todayISO(), w * 7), index: Math.round(clamp((base + bump + ski + expo), 0, 100)), tags: [] });
-    }
-  }
-  return out;
-})();
-
-const DEFAULT_WEIGHTS /** @type {Weights} */ = {
-  demand: 0.35, whitespace: 0.2, corner: 0.15, lead: 0.1, feas: 0.1, stock: 0.1, risk: 0.1,
-};
-
-// ---------- Priority Score ----------
-
-/**
- * Compute location priority score for a given area context & signals.
- * @param {Location} loc
- * @param {SeasonalityIndex[]} season
- * @param {Signal[]} signals
- * @param {Weights} w
- */
-function computePriority(loc, season, signals, w) {
-  const now = todayISO();
-  const sThis = season.filter((s) => s.area === loc.area).slice(0, 8); // next 8 weeks
-  const sMax = sThis.reduce((m, s) => Math.max(m, s.index), 1);
-  const demandIndex = sMax / 100; // 0..1
-
-  // Signals in this area within next 6 weeks
-  const sig = signals.filter(
-    (x) => x.area === loc.area && new Date(x.startAt) <= new Date(addDaysISO(now, 42))
-  );
-  const deltaTouch = sig.reduce((sum, x) => sum + x.deltaTouch * x.trust, 0);
-  const demand = clamp(demandIndex + deltaTouch / 1000, 0, 1); // normalized
-
-  const whitespace = loc.whitespace; // 0..1
-  const corner = loc.corner; // 0..1
-  const feas = (loc.installability + (loc.power ? 0.1 : -0.2) + (loc.line ? 0.1 : -0.2)) / 1.3; // approx
-  const stock = 0.8; // placeholder from inventory fit; tune with real data
-  const risk = loc.risk; // 0..1
-
-  // Lead: nearing deadlines in signals => higher urgency
-  const soonSig = sig
-    .map((x) => ({ x, d: (new Date(x.deadline) - new Date(now)) / 86400000 }))
-    .filter((o) => o.d >= -7 && o.d <= 28);
-  const lead = clamp(soonSig.length ? 1 - Math.min(...soonSig.map((o) => o.d)) / 28 : 0, 0, 1);
-
-  const score =
-    w.demand * demand +
-    w.whitespace * whitespace +
-    w.corner * corner +
-    w.lead * lead +
-    w.feas * feas +
-    w.stock * stock -
-    w.risk * risk;
-
-  return { score: clamp(score, 0, 1), parts: { demand, whitespace, corner, lead, feas, stock, risk } };
-}
-
-// ---------- UI Components ----------
-
-function Section({ title, icon: Icon = Sparkles, actions, children }) {
-  return (
-    <div className="mb-6">
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <Icon className="w-5 h-5" />
-          <h2 className="text-lg font-semibold">{title}</h2>
+        <!-- フィルタコントロール -->
+        <div id="filter-controls" class="mb-6 p-4 bg-white rounded-lg shadow-sm border border-gray-200">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <!-- キーワード検索 (Title) -->
+                <div>
+                    <label for="filter-keyword" class="block text-sm font-medium text-gray-700">記事タイトル:</label>
+                    <input type="text" id="filter-keyword" name="filter-keyword" placeholder="キーワードを入力..." class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm">
+                </div>
+                <!-- レンズフィルタ (H列) -->
+                <div>
+                    <label for="lens-filter" class="block text-sm font-medium text-gray-700">カテゴリ:</label>
+                    <select id="lens-filter" name="lens-filter" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md">
+                        <option value="all">すべてのカテゴリ</option>
+                        <!-- オプションはJSで動的に追加 -->
+                    </select>
+                </div>
+                <!-- 日付フィルタ (D列) -->
+                <div>
+                    <label for="date-filter" class="block text-sm font-medium text-gray-700">公開日時:</label>
+                    <select id="date-filter" name="date-filter" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md">
+                        <option value="all">すべて</option>
+                        <option value="today">本日</option>
+                        <option value="week" selected>直近1週間以内</option>
+                        <option value="month">直近1か月以内</option>
+                        <option value="3month">直近3か月以内</option>
+                        <option value="6month">直近半年以内</option>
+                        <option value="year">直近1年以内</option>
+                    </select>
+                </div>
+            </div>
+            <!-- リセットボタン -->
+            <div class="mt-4 text-right">
+                <button id="filter-reset" class="px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                    フィルタをリセット
+                </button>
+            </div>
         </div>
-        <div className="flex items-center gap-2">{actions}</div>
-      </div>
-      <div className="bg-white/5 border border-white/10 rounded-2xl p-4 shadow-sm">{children}</div>
+
+        <!-- スコア凡例 (新規追加) -->
+        <div id="score-legend" class="mb-6 p-4 bg-gray-100 rounded-lg border border-gray-200">
+            <h4 class="text-sm font-bold text-gray-700 mb-2">スコア凡例 (判定目安)</h4>
+            <div class="flex flex-col sm:flex-row sm:flex-wrap gap-x-4 gap-y-2">
+                <div class="flex items-center space-x-2">
+                    <span class="flex-shrink-0 w-4 h-4 rounded-full bg-red-100 ring-1 ring-red-200"></span>
+                    <span class="text-sm text-red-600 font-medium">5.0 以上: 優先度高</span>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <span class="flex-shrink-0 w-4 h-4 rounded-full bg-yellow-100 ring-1 ring-yellow-200"></span>
+                    <span class="text-sm text-yellow-700 font-medium">3.5 – 4.9: 優先度中</span>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <span class="flex-shrink-0 w-4 h-4 rounded-full bg-blue-100 ring-1 ring-blue-200"></span>
+                    <span class="text-sm text-blue-600 font-medium">3.4 以下: 優先度低</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- ローディング表示 -->
+        <div id="loading" class="flex flex-col items-center justify-center py-16">
+            <div class="loader"></div>
+            <p class="mt-4 text-gray-600">データを読み込んでいます...</p>
+        </div>
+
+        <!-- エラー表示 -->
+        <div id="error" class="hidden bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg" role="alert">
+            <strong class="font-bold">エラー:</strong>
+            <span id="error-message" class="block sm:inline"></span>
+        </div>
+
+        <!-- データリスト -->
+        <div id="signals-list" class="space-y-4">
+            <!-- データはJSによってここに挿入されます -->
+        </div>
+
     </div>
-  );
-}
 
-function StatCard({ label, value, sub, icon: Icon = Activity }) {
-  return (
-    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 flex items-center gap-3">
-      <div className="rounded-xl bg-white/10 p-2"><Icon className="w-5 h-5" /></div>
-      <div>
-        <div className="text-sm text-white/70">{label}</div>
-        <div className="text-xl font-bold">{value}</div>
-        {sub && <div className="text-xs text-white/60 mt-0.5">{sub}</div>}
-      </div>
-    </div>
-  );
-}
+    <script>
+        // --- 定数 ---
+        const SPREADSHEET_ID = '1kJDx3xxY7lX6mFfHeY2vSBPqUILcHhIY6ncNTCHACQ4';
+        const GID = '581566144';
+        const API_URL = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?gid=${GID}&tqx=out:json`;
 
-function Badge({ children, tone = "default" }) {
-  const map = {
-    default: "bg-white/10 text-white",
-    success: "bg-emerald-500/20 text-emerald-200",
-    warn: "bg-amber-500/20 text-amber-100",
-    danger: "bg-rose-500/20 text-rose-100",
-    info: "bg-sky-500/20 text-sky-100",
-  };
-  return <span className={`px-2 py-1 rounded-lg text-xs ${map[tone]}`}>{children}</span>;
-}
+        const GEMINI_API_KEY = ""; // Canvasが自動挿入
+        const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${GEMINI_API_KEY}`;
 
-function Pill({ children }) {
-  return <span className="px-2 py-1 rounded-full bg-white/10 text-xs">{children}</span>;
-}
 
-function Table({ columns, rows, keyField = "id", onRowClick }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="min-w-full text-sm">
-        <thead>
-          <tr className="text-left text-white/70 border-b border-white/10">
-            {columns.map((c) => (
-              <th key={c.key} className="py-2 pr-4 font-medium">{c.label}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r[keyField]} className="border-b border-white/5 hover:bg-white/5 cursor-pointer" onClick={() => onRowClick && onRowClick(r)}>
-              {columns.map((c) => (
-                <td key={c.key} className="py-2 pr-4">{c.render ? c.render(r[c.key], r) : r[c.key]}</td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
+        // --- DOM要素 ---
+        const loadingEl = document.getElementById('loading');
+        const errorEl = document.getElementById('error');
+        const errorMessageEl = document.getElementById('error-message');
+        const listEl = document.getElementById('signals-list');
+        
+        // フィルタUIの要素 (変更)
+        const filterKeywordEl = document.getElementById('filter-keyword');
+        const lensFilterEl = document.getElementById('lens-filter');
+        const dateFilterEl = document.getElementById('date-filter');
+        const filterResetBtn = document.getElementById('filter-reset');
 
-function HeatmapGrid({ data }) {
-  // data: [{area, weekISO, index}]
-  const weeks = [...new Set(data.map((d) => d.weekISO))].sort();
-  const areas = [...new Set(data.map((d) => d.area))];
-  return (
-    <div className="overflow-x-auto">
-      <table className="text-xs">
-        <thead>
-          <tr>
-            <th className="text-left pr-2">エリア</th>
-            {weeks.map((w) => (
-              <th key={w} className="px-1 text-center text-white/60">{w.slice(5)}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {areas.map((a) => (
-            <tr key={a}>
-              <td className="pr-2 font-medium">{a}</td>
-              {weeks.map((w) => {
-                const cell = data.find((d) => d.area === a && d.weekISO === w);
-                const v = cell ? cell.index : 0;
-                const bg = `hsl(${clamp(120 - v, 0, 120)},70%,${30 + v * 0.3}%)`;
-                return (
-                  <td key={w} title={`${a} ${w}: S=${v}`} className="w-8 h-6">
-                    <div className="w-8 h-6 rounded" style={{ backgroundColor: bg }} />
-                  </td>
+        // --- グローバル変数 ---
+        let allSignalsData = []; // 全データを保持する配列
+
+        // --- メイン処理 ---
+        window.addEventListener('DOMContentLoaded', () => {
+            fetchData();
+
+            // フィルタUIにイベントリスナーを設定 (変更)
+            filterKeywordEl.addEventListener('input', applyFiltersAndDisplay);
+            lensFilterEl.addEventListener('change', applyFiltersAndDisplay);
+            dateFilterEl.addEventListener('change', applyFiltersAndDisplay);
+            
+            filterResetBtn.addEventListener('click', () => {
+                filterKeywordEl.value = '';
+                lensFilterEl.value = 'all';
+                dateFilterEl.value = 'week'; // リセット時は「1週間以内」に戻す
+                applyFiltersAndDisplay();
+            });
+        });
+
+        /**
+         * データをフェッチして処理する
+         */
+        async function fetchData() {
+            try {
+                const response = await fetch(API_URL);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const text = await response.text();
+                const jsonText = text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1);
+                const data = JSON.parse(jsonText);
+
+                const parsedData = parseSheetData(data.table);
+                allSignalsData = parsedData;
+                
+                // (新規) レンズフィルタのオプションを設定
+                setupLensFilter();
+
+                // 初回表示（フィルタ適用）
+                applyFiltersAndDisplay();
+
+            } catch (err) {
+                console.error('データの取得に失敗しました:', err);
+                showError('データの取得に失敗しました。シートが公開されているか確認してください。');
+            } finally {
+                loadingEl.classList.add('hidden');
+            }
+        }
+
+        /**
+         * (新規) H列のレンズ（カテゴリ）一覧をフィルタに設定する
+         */
+        function setupLensFilter() {
+            // allSignalsDataからユニークなlens名を取得し、ソートする
+            const uniqueLenses = [...new Set(allSignalsData.map(item => item.lens))]
+                                 .filter(lens => lens !== '分類なし') // 「分類なし」を除外
+                                 .sort(); 
+            
+            // 既存のオプション（"すべてのレンズ"以外）をクリア
+            Array.from(lensFilterEl.options).forEach(option => {
+                if (option.value !== 'all') {
+                    option.remove();
+                }
+            });
+
+            // ユニークなlens名をオプションとして追加
+            uniqueLenses.forEach(lens => {
+                const option = document.createElement('option');
+                option.value = lens;
+                option.textContent = lens;
+                lensFilterEl.appendChild(option);
+            });
+        }
+
+        /**
+         * (修正) フィルタとソートを適用してデータを表示する
+         */
+        function applyFiltersAndDisplay() {
+            // 1. フィルタ条件を取得
+            const keyword = filterKeywordEl.value.toLowerCase().trim();
+            const selectedLens = lensFilterEl.value;
+            const selectedDateRange = dateFilterEl.value;
+
+            // (修正) 2. 日付フィルタ
+            const { startDate } = getDateRange(selectedDateRange);
+            
+            let filteredData = allSignalsData.filter(item => {
+                // 日付フィルタ（日付が不正なデータは除外）
+                if (!item.published) return false;
+                if (startDate && item.published < startDate) {
+                    return false;
+                }
+                return true;
+            });
+
+            // (修正) 3. キーワードフィルタ (Titleのみ)
+            if (keyword) {
+                filteredData = filteredData.filter(item => 
+                    item.title.toLowerCase().includes(keyword)
                 );
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
+            }
+            
+            // (新規) 4. レンズフィルタ (H列)
+            if (selectedLens !== 'all') {
+                filteredData = filteredData.filter(item => 
+                    item.lens === selectedLens
+                );
+            }
+            
+            // 5. スコアで降順ソート
+            filteredData.sort((a, b) => b.score - a.score);
 
-function Modal({ open, onClose, title, children }) {
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/60" onClick={onClose} />
-      <div className="relative w-full max-w-3xl bg-neutral-900 border border-white/10 rounded-2xl p-5 shadow-xl">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-lg font-semibold">{title}</h3>
-          <button onClick={onClose} className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20">閉じる</button>
-        </div>
-        {children}
-      </div>
-    </div>
-  );
-}
+            // 6. データを表示
+            displayData(filteredData);
+        }
 
-// ---------- Main App ----------
+        /**
+         * Google gvizのtableデータを解析してオブジェクトの配列に変換する
+         * @param {object} table - Google gvizのtableオブジェクト
+         * @returns {Array<object>}
+         */
+        function parseSheetData(table) {
+            // 必要な列のインデックス（列番号）を特定 (ID 'A', 'B', 'C'...)
+            const findIndexById = (id) => table.cols.findIndex(col => col.id === id);
+            
+            const titleIndex = findIndexById('E');
+            const urlIndex = findIndexById('F');
+            const publishedIndex = findIndexById('D');
+            const lensIndex = findIndexById('H');
+            const domainIndex = findIndexById('I');
+            const scoreIndex = findIndexById('K');
 
-export default function SalesOpsPortal() {
-  const [weights, setWeights] = useState/** @type {[Weights, any]} */(
-    () => Storage.load("weights", DEFAULT_WEIGHTS)
-  );
-  const [signals, setSignals] = useState/** @type {[Signal[], any]} */(
-    () => Storage.load("signals", MOCK_SIGNALS)
-  );
-  const [locations, setLocations] = useState/** @type {[Location[], any]} */(
-    () => Storage.load("locations", MOCK_LOCATIONS)
-  );
-  const [season, setSeason] = useState/** @type {[SeasonalityIndex[], any]} */(
-    () => Storage.load("season", MOCK_SEASON)
-  );
-  const [deals, setDeals] = useState/** @type {[Deal[], any]} */(
-    () => Storage.load("deals", [])
-  );
-  const [experiments, setExperiments] = useState/** @type {[Experiment[], any]} */(
-    () => Storage.load("experiments", [])
-  );
+            // 必須列のチェック
+            if ([titleIndex, urlIndex, publishedIndex, lensIndex, domainIndex, scoreIndex].some(index => index === -1)) {
+                const missing = [
+                    titleIndex === -1 ? 'Title (E列)' : '',
+                    urlIndex === -1 ? 'Url (F列)' : '',
+                    publishedIndex === -1 ? 'Published (D列)' : '',
+                    lensIndex === -1 ? 'Lens (H列)' : '',
+                    domainIndex === -1 ? 'Domain (I列)' : '',
+                    scoreIndex === -1 ? 'Score (K列)' : ''
+                ].filter(Boolean).join(', ');
+                throw new Error(`必須列が見つかりません: ${missing}`);
+            }
 
-  const [tab, setTab] = useState("dashboard");
-  const [query, setQuery] = useState("");
-  const [selectedArea, setSelectedArea] = useState("すべて");
-  const [dealModal, setDealModal] = useState/** @type {[Deal|null, any]} */(null);
-  const [signalModal, setSignalModal] = useState/** @type {[Signal|null, any]} */(null);
+            return table.rows.map(row => {
+                const cells = row.c;
+                
+                const score = cells[scoreIndex] ? parseFloat(cells[scoreIndex].v) : NaN;
+                if (isNaN(score)) return null;
+                
+                const gvizDateString = cells[publishedIndex] ? cells[publishedIndex].v : null;
+                const publishedDate = gvizDateString ? parseGvizDate(gvizDateString) : null;
+                
+                return {
+                    title: cells[titleIndex] ? (cells[titleIndex].v || 'タイトルなし') : 'タイトルなし',
+                    url: cells[urlIndex] ? (cells[urlIndex].v || '#') : '#',
+                    published: publishedDate,
+                    lens: cells[lensIndex] ? (cells[lensIndex].v || '分類なし') : '分類なし',
+                    domain: cells[domainIndex] ? (cells[domainIndex].v || 'ドメイン不明') : 'ドメイン不明',
+                    score: score
+                };
+            }).filter(item => item !== null);
+        }
 
-  useEffect(() => Storage.save("weights", weights), [weights]);
-  useEffect(() => Storage.save("signals", signals), [signals]);
-  useEffect(() => Storage.save("locations", locations), [locations]);
-  useEffect(() => Storage.save("season", season), [season]);
-  useEffect(() => Storage.save("deals", deals), [deals]);
-  useEffect(() => Storage.save("experiments", experiments), [experiments]);
+        /**
+         * (修正) 処理済みデータをHTMLとしてリストに表示する
+         * @param {Array<object>} data
+         */
+        function displayData(data) {
+            if (data.length === 0) {
+                // フィルタ条件によってメッセージを変更
+                if (filterKeywordEl.value || lensFilterEl.value !== 'all' || dateFilterEl.value !== 'all') {
+                    listEl.innerHTML = '<p class="text-gray-600 text-center py-8">該当するシグナルはありません。</p>';
+                } else {
+                    listEl.innerHTML = '<p class="text-gray-600 text-center py-8">表示するデータがありません。</p>';
+                }
+                return;
+            }
 
-  const scored = useMemo(() => {
-    return locations.map((loc) => {
-      const r = computePriority(loc, season, signals, weights);
-      return { ...loc, priority: r.score, parts: r.parts };
-    }).sort((a, b) => b.priority - a.priority);
-  }, [locations, season, signals, weights]);
+            const htmlItems = data.map((item, index) => {
+                const { scoreColor, scoreTextColor } = getScoreStyling(item.score);
+                const scoreLabel = item.lens; 
+                const publishedFormatted = item.published ? formatDate(item.published) : '日付不明';
 
-  const alerts = useMemo(() => {
-    const now = todayISO();
-    const items = [];
-    for (const s of signals) {
-      const days = Math.round((new Date(s.deadline) - new Date(now)) / 86400000);
-      if (days <= 14) items.push({ level: days < 0 ? "danger" : days <= 7 ? "warn" : "info", text: `シグナル期限: ${s.title}（${s.area}）T${days>=0?"-":"+"}${Math.abs(days)}日` });
-    }
-    for (const d of deals) {
-      const days = Math.round((new Date(d.sla.liveBy) - new Date(now)) / 86400000);
-      if (days <= 21 && d.stage !== "live") items.push({ level: days < 0 ? "danger" : "warn", text: `稼働SLA逼迫: ${d.id}（${d.stage}）残り${days}日` });
-    }
-    return items.slice(0, 6);
-  }, [signals, deals]);
+                const summaryButtonId = `summary-btn-${index}`;
+                const summaryContentId = `summary-content-${index}`;
 
-  const stock = { available: 6, capacity: 14, waitlist: 5 }; // MVP constants
+                return `
+                <div class="bg-white shadow-md rounded-lg border border-gray-200 overflow-hidden">
+                    <a href="${item.url}" target="_blank" rel="noopener noreferrer" class="block transition duration-200 ease-in-out transform hover:bg-gray-50">
+                        <article class="p-5 flex items-start space-x-4">
+                            
+                            <!-- スコア表示 (Left) -->
+                            <div class="flex-shrink-0 flex flex-col items-center w-20 text-center">
+                                <div class="px-2 py-0.5 rounded-full text-xs font-semibold ${scoreColor} ${scoreTextColor} truncate" title="${scoreLabel}">
+                                    ${scoreLabel}
+                                </div>
+                                <div class="mt-2 text-3xl font-bold ${scoreTextColor}">
+                                    ${item.score.toFixed(1)}
+                                </div>
+                            </div>
 
-  const filteredSignals = useMemo(() => {
-    return signals.filter((s) => (selectedArea === "すべて" || s.area === selectedArea) && (s.title.includes(query) || s.source.includes(query)));
-  }, [signals, query, selectedArea]);
+                            <!-- 記事内容 (Right) -->
+                            <div class="flex-grow min-w-0">
+                                <h3 class="text-lg font-bold text-gray-800 break-words">
+                                    ${item.title}
+                                </h3>
+                                <div class="mt-2 flex items-center text-sm text-gray-500 space-x-3">
+                                    <!-- Domain -->
+                                    <svg class="flex-shrink-0 w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418" />
+                                    </svg>
+                                    <span class="truncate" title="${item.domain}">${item.domain}</span>
+                                    
+                                    <span class="text-gray-300">|</span>
 
-  const filteredPriority = useMemo(() => {
-    return scored.filter((l) => (selectedArea === "すべて" || l.area === selectedArea) && (l.name.includes(query) || l.chain.includes(query)));
-  }, [scored, query, selectedArea]);
-
-  function createDealFromSignal(signal, locationId) {
-    const id = `D-${Date.now()}`;
-    const targetLive = signal.endAt > todayISO() ? signal.startAt : addDaysISO(todayISO(), 30);
-    const newDeal /** @type {Deal} */ = {
-      id, locationId, stage: "prospect", targetLiveAt: targetLive, capex: 1800000, roiEst: 12,
-      sla: {
-        contactBy: addDaysISO(todayISO(), 7),
-        approvalBy: addDaysISO(todayISO(), 21),
-        constructBy: addDaysISO(todayISO(), 35),
-        liveBy: addDaysISO(todayISO(), 45),
-      },
-      notes: `Signal linkage: ${signal.title}\nRecommended: ${signal.recommended.join(", ")}`,
-      createdAt: todayISO(),
-      signalId: signal.id,
-    };
-    setDeals((ds) => [newDeal, ...ds]);
-  }
-
-  function updateDealStage(deal, stage /** @type {DealStage} */) {
-    setDeals((ds) => ds.map((d) => (d.id === deal.id ? { ...d, stage } : d)));
-  }
-
-  function resetAll() {
-    if (!confirm("全データを初期のモックに戻します。よろしいですか？")) return;
-    setSignals(MOCK_SIGNALS);
-    setLocations(MOCK_LOCATIONS);
-    setSeason(MOCK_SEASON);
-    setDeals([]);
-    setExperiments([]);
-    setWeights(DEFAULT_WEIGHTS);
-  }
-
-  // ---------- Render ----------
-
-  return (
-    <div className="min-h-screen text-white bg-gradient-to-b from-neutral-900 to-black">
-      <header className="sticky top-0 z-40 backdrop-blur bg-black/30 border-b border-white/10">
-        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-4">
-          <Rocket className="w-5 h-5" />
-          <h1 className="font-bold tracking-tight">Sales Ops Portal — News × Seasonality OS</h1>
-          <div className="flex-1" />
-          <nav className="hidden md:flex items-center gap-2 text-sm">
-            {[
-              ["dashboard", "ダッシュボード", <BarChart3 key="i" className="w-4 h-4" />],
-              ["map", "マップ×カレンダー", <MapIcon key="i" className="w-4 h-4" />],
-              ["signals", "シグナル", <LibraryBig key="i" className="w-4 h-4" />],
-              ["priority", "優先度", <Target key="i" className="w-4 h-4" />],
-              ["deals", "案件", <ClipboardCheck key="i" className="w-4 h-4" />],
-              ["experiments", "検証", <Activity key="i" className="w-4 h-4" />],
-              ["admin", "管理", <Settings key="i" className="w-4 h-4" />],
-            ].map(([k, label, ic]) => (
-              <button key={k} onClick={() => setTab(String(k))} className={`px-3 py-1.5 rounded-xl hover:bg-white/10 flex items-center gap-1 ${tab===k?"bg-white/10":""}`}>
-                {ic}<span>{label}</span>
-              </button>
-            ))}
-          </nav>
-        </div>
-      </header>
-
-      <main className="max-w-7xl mx-auto px-4 py-6">
-        {/* Global filters */}
-        <div className="flex flex-col md:flex-row gap-3 mb-4">
-          <div className="flex items-center gap-2 flex-1">
-            <Filter className="w-4 h-4" />
-            <input value={query} onChange={(e)=>setQuery(e.target.value)} placeholder="検索（施設名/チェーン/シグナル）" className="w-full px-3 py-2 rounded-xl bg-white/10 focus:outline-none" />
-          </div>
-          <div className="flex items-center gap-2">
-            <Globe2 className="w-4 h-4" />
-            <select value={selectedArea} onChange={(e)=>setSelectedArea(e.target.value)} className="px-3 py-2 rounded-xl bg-white/10">
-              {["すべて", ...AREAS].map((a)=> <option key={a} value={a}>{a}</option>)}
-            </select>
-          </div>
-          <button onClick={resetAll} className="px-3 py-2 rounded-xl bg-rose-600/80 hover:bg-rose-600 flex items-center gap-2"><RefreshCw className="w-4 h-4"/>リセット</button>
-        </div>
-
-        {tab === "dashboard" && (
-          <div>
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
-              <StatCard label="今週の重要シグナル" value={signals.length} sub="信頼度0.7+" icon={Bell} />
-              <StatCard label="優先度Top20の平均" value={(filteredPriority.slice(0,20).reduce((s,x)=>s+x.priority,0)/Math.max(1,Math.min(20,filteredPriority.length))).toFixed(2)} sub="需要×角×SLA" icon={TrendingUp} />
-              <StatCard label="在庫(出庫可能)" value={stock.available} sub="今月の施工枠: 14" icon={BadgeCheck} />
-              <StatCard label="アラート" value={alerts.length} sub="期限/稼働SLA/効果鈍化" icon={AlertTriangle} />
-            </div>
-
-            <Section title="アラート / リスク" icon={AlertTriangle} actions={<Pill>JST {todayISO()}</Pill>}>
-              {alerts.length === 0 ? (
-                <div className="text-white/70">現在、重大なアラートはありません。</div>
-              ) : (
-                <ul className="grid md:grid-cols-2 gap-2">
-                  {alerts.map((a, i) => (
-                    <li key={i} className="flex items-center gap-2 p-2 rounded-xl bg-white/5 border border-white/10">
-                      <span>{a.level === "danger" ? <AlertTriangle className="w-4 h-4 text-rose-300"/> : a.level === "warn" ? <AlertTriangle className="w-4 h-4 text-amber-200"/> : <Bell className="w-4 h-4 text-sky-200"/>}</span>
-                      <span>{a.text}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </Section>
-
-            <Section title="週次ヒートマップ（需要指数S）" icon={BarChart3}>
-              <HeatmapGrid data={season} />
-            </Section>
-
-            <Section title="優先度ランキング Top 20" icon={Target} actions={<Pill>角（横展開）× 白地 × 需要</Pill>}>
-              <Table
-                columns={[
-                  { key: "name", label: "地点" },
-                  { key: "area", label: "エリア" },
-                  { key: "chain", label: "チェーン" },
-                  { key: "priority", label: "Score", render: (v, r) => <span className="font-semibold">{v.toFixed(2)}</span> },
-                  { key: "parts", label: "要素", render: (v, r) => (
-                    <div className="flex flex-wrap gap-1">
-                      <Badge tone="info">需要 {fmtPct(v.demand)}</Badge>
-                      <Badge>白地 {fmtPct(v.whitespace)}</Badge>
-                      <Badge>角 {fmtPct(v.corner)}</Badge>
-                      <Badge tone="warn">期限 {fmtPct(v.lead)}</Badge>
-                      <Badge>施工 {fmtPct(v.feas)}</Badge>
-                      <Badge>在庫 {fmtPct(v.stock)}</Badge>
-                      <Badge tone="danger">リスク {fmtPct(v.risk)}</Badge>
+                                    <!-- Published Date -->
+                                    <svg class="flex-shrink-0 w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 012.25-2.25h13.5A2.25 2.25 0 0121 7.5v11.25m-18 0A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75m-18 0v-7.5A2.25 2.25 0 015.25 9h13.5A2.25 2.25 0 0121 11.25v7.5" />
+                                    </svg>
+                                    <span>${publishedFormatted}</span>
+                                </div>
+                            </div>
+                        </article>
+                    </a>
+                    
+                    <!-- 概要生成エリア -->
+                    <div class="px-5 pb-4">
+                        <button 
+                            id="${summaryButtonId}"
+                            data-title="${encodeURIComponent(item.title)}" 
+                            data-target-id="${summaryContentId}"
+                            class="px-3 py-1.5 text-sm font-medium text-blue-600 bg-blue-100 rounded-md hover:bg-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+                        >
+                            記事の概要を生成 (Gemini)
+                        </button>
+                        <div id="${summaryContentId}" class="summary-content text-gray-700 text-sm mt-3 pt-3 border-t border-gray-200" style="display: none;">
+                            <!-- 概要はここに挿入されます -->
+                        </div>
                     </div>
-                  ) },
-                ]}
-                rows={filteredPriority.slice(0, 20)}
-                onRowClick={(r)=>{
-                  const linkedDeals = deals.filter((d)=>d.locationId===r.id);
-                  const msg = linkedDeals.length ? `関連案件: \n${linkedDeals.map(d=>`${d.id} (${d.stage})`).join("\n")}` : "関連案件なし";
-                  alert(`${r.name} — Score ${r.priority.toFixed(2)}\n${msg}`);
-                }}
-              />
-            </Section>
-          </div>
-        )}
-
-        {tab === "map" && (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <Section title="カレンダー" icon={CalendarIcon}>
-              <ul className="space-y-2 text-sm">
-                {signals
-                  .slice()
-                  .sort((a,b)=> new Date(a.startAt) - new Date(b.startAt))
-                  .map((s)=> (
-                    <li key={s.id} className="p-2 rounded-xl bg-white/5 border border-white/10">
-                      <div className="flex items-center justify-between">
-                        <div className="font-medium">{s.title}</div>
-                        <Badge tone="info">{s.type}</Badge>
-                      </div>
-                      <div className="text-white/70">{s.area}｜{s.startAt} → {s.endAt}｜Δタッチ~{s.deltaTouch}</div>
-                      <div className="mt-2 flex items-center gap-2">
-                        <button onClick={()=>setSignalModal(s)} className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-xs">詳細</button>
-                        <button onClick={()=>createDealFromSignal(s, locations[0].id)} className="px-2 py-1 rounded-lg bg-emerald-600/80 hover:bg-emerald-600 text-xs">このシグナルで起案</button>
-                      </div>
-                    </li>
-                  ))}
-              </ul>
-            </Section>
-            <div className="md:col-span-2">
-              <Section title="マップ（簡易スキャッタ）" icon={MapIcon} actions={<Pill>範囲：日本</Pill>}>
-                <div className="w-full h-[420px] relative rounded-2xl bg-gradient-to-b from-slate-900 to-slate-950 border border-white/10 overflow-hidden">
-                  {locations.map((l)=>{
-                    const { x, y } = projectXY(l.lat, l.lng, 900, 420);
-                    const pr = scored.find((s)=>s.id===l.id)?.priority ?? 0.2;
-                    const size = 8 + pr * 16;
-                    return (
-                      <div key={l.id} title={`${l.name} (${l.area}) Score ${pr.toFixed(2)}`}
-                        className="absolute -translate-x-1/2 -translate-y-1/2"
-                        style={{ left: `${x/900*100}%`, top: `${y/420*100}%` }}
-                        onClick={()=> alert(`${l.name}\nScore ${pr.toFixed(2)}`)}
-                      >
-                        <div className="rounded-full bg-emerald-400/30 border border-emerald-300/40" style={{ width: size, height: size }} />
-                      </div>
-                    );
-                  })}
-                  <div className="absolute bottom-2 right-2 text-xs text-white/60">※デモ用の簡易プロジェクション</div>
                 </div>
-              </Section>
-            </div>
-          </div>
-        )}
+                `;
+            });
 
-        {tab === "signals" && (
-          <div>
-            <Section title="シグナルInbox" icon={LibraryBig} actions={<Badge tone="info">{filteredSignals.length} 件</Badge>}>
-              <Table
-                columns={[
-                  { key: "title", label: "タイトル" },
-                  { key: "area", label: "エリア" },
-                  { key: "type", label: "種別" },
-                  { key: "startAt", label: "開始" },
-                  { key: "endAt", label: "終了" },
-                  { key: "deadline", label: "期限" },
-                  { key: "deltaTouch", label: "Δタッチ" },
-                  { key: "trust", label: "信頼度", render: (v) => fmtPct(v) },
-                ]}
-                rows={filteredSignals}
-                onRowClick={(r)=> setSignalModal(r)}
-              />
-            </Section>
-          </div>
-        )}
+            listEl.innerHTML = htmlItems.join('');
+            addSummaryButtonListeners();
+        }
 
-        {tab === "priority" && (
-          <div>
-            <Section title="優先度ランキング" icon={Target} actions={<Badge>{filteredPriority.length} 地点</Badge>}>
-              <Table
-                columns={[
-                  { key: "name", label: "地点" },
-                  { key: "area", label: "エリア" },
-                  { key: "chain", label: "チェーン" },
-                  { key: "priority", label: "Score", render: (v) => <span className="font-semibold">{v.toFixed(2)}</span> },
-                  { key: "parts", label: "要素", render: (v) => (
-                    <div className="flex flex-wrap gap-1">
-                      <Badge tone="info">需要 {fmtPct(v.demand)}</Badge>
-                      <Badge>白地 {fmtPct(v.whitespace)}</Badge>
-                      <Badge>角 {fmtPct(v.corner)}</Badge>
-                      <Badge tone="warn">期限 {fmtPct(v.lead)}</Badge>
-                      <Badge>施工 {fmtPct(v.feas)}</Badge>
-                      <Badge>在庫 {fmtPct(v.stock)}</Badge>
-                      <Badge tone="danger">リスク {fmtPct(v.risk)}</Badge>
-                    </div>
-                  ) },
-                ]}
-                rows={filteredPriority}
-                onRowClick={(r)=>{
-                  if (confirm(`${r.name} を案件化しますか？`)) {
-                    const fakeSig = signals[0];
-                    createDealFromSignal(fakeSig, r.id);
-                    setTab("deals");
-                  }
-                }}
-              />
-            </Section>
-          </div>
-        )}
+        /**
+         * 概要生成ボタンにイベントリスナーを設定する
+         */
+        function addSummaryButtonListeners() {
+            const summaryButtons = document.querySelectorAll('[id^="summary-btn-"]');
+            summaryButtons.forEach(button => {
+                button.replaceWith(button.cloneNode(true));
+                const newButton = document.getElementById(button.id);
+                newButton.addEventListener('click', handleSummaryClick);
+            });
+        }
 
-        {tab === "deals" && (
-          <div>
-            <Section title="案件一覧" icon={ClipboardCheck} actions={<Badge tone="info">{deals.length} 件</Badge>}>
-              <Table
-                columns={[
-                  { key: "id", label: "案件ID" },
-                  { key: "locationId", label: "地点", render: (v)=> locations.find((l)=>l.id===v)?.name || v },
-                  { key: "stage", label: "ステージ", render: (v)=> <Badge tone={v==="live"?"success": v==="installing"?"info":"default"}>{v}</Badge> },
-                  { key: "targetLiveAt", label: "稼働目標" },
-                  { key: "roiEst", label: "回収(月)" },
-                ]}
-                rows={deals}
-                onRowClick={(r)=> setDealModal(r)}
-              />
-            </Section>
-          </div>
-        )}
+        /**
+         * 概要生成ボタンがクリックされたときの処理
+         * (中身は変更なし)
+         */
+        async function handleSummaryClick(event) {
+            const button = event.currentTarget;
+            const targetId = button.dataset.targetId;
+            const articleTitle = decodeURIComponent(button.dataset.title);
+            const contentEl = document.getElementById(targetId);
 
-        {tab === "experiments" && (
-          <div>
-            <Section title="検証ログ" icon={Activity}>
-              <div className="grid md:grid-cols-2 gap-4">
-                <form onSubmit={(e)=>{ e.preventDefault();
-                  const fd = new FormData(e.currentTarget);
-                  const ex = /** @type {Experiment} */({
-                    id: `E-${Date.now()}`,
-                    design: fd.get("design"),
-                    name: String(fd.get("name")),
-                    startAt: String(fd.get("startAt")),
-                    endAt: String(fd.get("endAt")),
-                    groups: String(fd.get("groups")),
-                    metric: String(fd.get("metric")),
-                    minDetectableEffect: Number(fd.get("mde")),
-                  });
-                  setExperiments((xs)=> [ex, ...xs]);
-                  e.currentTarget.reset();
-                }} className="bg-white/5 border border-white/10 rounded-2xl p-4">
-                  <div className="font-semibold mb-2">新規登録</div>
-                  <div className="grid grid-cols-2 gap-2 text-sm">
-                    <label className="col-span-2">名称<input name="name" required className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
-                    <label>デザイン<select name="design" className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"><option value="stepwedge">ステップウェッジ</option><option value="did">差分の差分</option><option value="synth">合成対照</option></select></label>
-                    <label>指標<input name="metric" defaultValue="タッチ数" className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
-                    <label>開始<input type="date" name="startAt" defaultValue={todayISO()} className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
-                    <label>終了<input type="date" name="endAt" defaultValue={addDaysISO(todayISO(), 28)} className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
-                    <label className="col-span-2">群設定<textarea name="groups" placeholder="例）関西=導入, 関東=対照（週ズラし）" className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
-                    <label>MDE<input type="number" step="1" name="mde" defaultValue={10} className="mt-1 w-full px-3 py-2 rounded-lg bg-white/10"/></label>
-                    <div className="col-span-2 flex justify-end"><button className="px-3 py-2 rounded-xl bg-emerald-600/80 hover:bg-emerald-600">登録</button></div>
-                  </div>
-                </form>
-                <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
-                  <div className="font-semibold mb-2">一覧</div>
-                  <ul className="space-y-2 text-sm">
-                    {experiments.map((x)=> (
-                      <li key={x.id} className="p-2 rounded-xl bg-white/5 border border-white/10">
-                        <div className="flex items-center justify-between"><div className="font-medium">{x.name}</div><Badge tone="info">{x.design}</Badge></div>
-                        <div className="text-white/70">{x.startAt} → {x.endAt}｜MDE≈{x.minDetectableEffect}%｜指標:{x.metric}</div>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              </div>
-            </Section>
-          </div>
-        )}
+            if (!contentEl) return;
+            if (button.disabled) return;
 
-        {tab === "admin" && (
-          <div className="grid md:grid-cols-2 gap-4">
-            <Section title="重み（優先度スコア）" icon={Settings}>
-              <div className="grid grid-cols-2 gap-2 text-sm">
-                {Object.entries(weights).map(([k,v])=> (
-                  <label key={k} className="flex items-center gap-2">{k}
-                    <input type="range" min={0} max={0.5} step={0.01} value={v}
-                      onChange={(e)=> setWeights((w)=> ({ ...w, [k]: Number(e.target.value) }))}
-                      className="flex-1"/>
-                    <span className="w-12 text-right">{Number(v).toFixed(2)}</span>
-                  </label>
-                ))}
-              </div>
-              <div className="text-xs text-white/60 mt-2">※ 合計1.3でも動きます（リスクは減点）。運用で調整してください。</div>
-            </Section>
-            <Section title="辞書/初期データ" icon={LibraryBig}>
-              <div className="text-sm space-y-2">
-                <div>エリア: {AREAS.join(", ")}</div>
-                <div>チェーン規約（例）: コンビニ=全店一斉 / ホテル=客室・EV掲出可（要許諾）</div>
-                <div className="flex gap-2 mt-2">
-                  <button onClick={()=>{
-                    const s = prompt("手動シグナル追加（タイトル）");
-                    if (!s) return;
-                    setSignals((arr)=> [{ id:`S-${Date.now()}`, type:"event", title:s, source:"Manual", trust:.7, area:"東京", startAt: todayISO(), endAt: addDaysISO(todayISO(), 7), deadline: addDaysISO(todayISO(), 3), deltaTouch: 50, recommended:["MEO更新"] }, ...arr]);
-                  }} className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20">シグナル追加</button>
-                  <button onClick={resetAll} className="px-3 py-2 rounded-xl bg-rose-600/80 hover:bg-rose-600">全リセット</button>
-                </div>
-              </div>
-            </Section>
-          </div>
-        )}
-      </main>
+            if (contentEl.style.display === 'block') {
+                contentEl.style.display = 'none';
+                button.textContent = '記事の概要を生成 (Gemini)';
+                return;
+            }
 
-      {/* Signal Modal */}
-      <Modal open={!!signalModal} onClose={()=> setSignalModal(null)} title={signalModal?.title || ""}>
-        {signalModal && (
-          <div className="space-y-2 text-sm">
-            <div className="flex flex-wrap gap-2">
-              <Badge tone="info">{signalModal.type}</Badge>
-              <Badge>{signalModal.area}</Badge>
-              <Badge>Δタッチ~{signalModal.deltaTouch}</Badge>
-              <Badge tone={signalModal.trust>0.85?"success":"default"}>信頼度 {fmtPct(signalModal.trust)}</Badge>
-            </div>
-            <div className="text-white/70">期間: {signalModal.startAt} → {signalModal.endAt}</div>
-            <div className="text-white/70">期限: {signalModal.deadline}</div>
-            <div className="">推奨: {signalModal.recommended.join("、 ")}</div>
-            <div className="mt-3">
-              <label className="block mb-1">案件化する地点</label>
-              <select id="dealLoc" className="w-full px-3 py-2 rounded-xl bg-white/10">
-                {locations.map((l)=> <option key={l.id} value={l.id}>{l.name}（{l.area}）</option>)}
-              </select>
-              <div className="flex justify-end gap-2 mt-2">
-                <button onClick={()=>{
-                  const sel = document.getElementById("dealLoc");
-                  const locId = sel ? (sel /** @type {HTMLSelectElement} */).value : locations[0].id;
-                  createDealFromSignal(signalModal, locId);
-                  setSignalModal(null);
-                  setTab("deals");
-                }} className="px-3 py-2 rounded-xl bg-emerald-600/80 hover:bg-emerald-600">案件化</button>
-              </div>
-            </div>
-          </div>
-        )}
-      </Modal>
+            button.disabled = true;
+            button.textContent = '生成中...';
+            contentEl.style.display = 'block';
+            contentEl.innerHTML = '<div class="flex justify-center items-center"><div class="loader !w-6 !h-6"></div></div>'; 
 
-      {/* Deal Modal */}
-      <Modal open={!!dealModal} onClose={()=> setDealModal(null)} title={dealModal ? `${dealModal.id} 詳細` : ""}>
-        {dealModal && (
-          <div className="space-y-3 text-sm">
-            <div className="flex flex-wrap gap-2">
-              <Badge tone={dealModal.stage==="live"?"success":dealModal.stage==="installing"?"info":"default"}>{dealModal.stage}</Badge>
-              <Badge>{locations.find((l)=>l.id===dealModal.locationId)?.name}</Badge>
-            </div>
-            <div>稼働目標: <b>{dealModal.targetLiveAt}</b></div>
-            <div>ROI目安: {dealModal.roiEst} ヶ月 / CAPEX: ¥{fmt.format(dealModal.capex)}</div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="bg-white/5 rounded-xl p-2">連絡期限: {dealModal.sla.contactBy}</div>
-              <div className="bg-white/5 rounded-xl p-2">承認期限: {dealModal.sla.approvalBy}</div>
-              <div className="bg-white/5 rounded-xl p-2">施工期限: {dealModal.sla.constructBy}</div>
-              <div className="bg-white/5 rounded-xl p-2">稼働期限: {dealModal.sla.liveBy}</div>
-            </div>
-            <div className="bg-white/5 rounded-xl p-2 whitespace-pre-wrap">{dealModal.notes}</div>
-            <div className="flex items-center gap-2">
-              {(["prospect","negotiation","approved","installing","live"]).map((st)=> (
-                <button key={st} onClick={()=> updateDealStage(dealModal, /** @type {DealStage} */(st))} className={`px-2 py-1 rounded-xl ${dealModal.stage===st?"bg-white/20":"bg-white/10 hover:bg-white/20"}`}>{st}</button>
-              ))}
-            </div>
-          </div>
-        )}
-      </Modal>
+            try {
+                const summary = await generateSummaryWithGemini(articleTitle);
+                contentEl.innerHTML = summary.replace(/\n/g, '<br>');
+                button.textContent = '概要を隠す';
+            } catch (error) {
+                console.error('概要生成エラー:', error);
+                contentEl.innerHTML = `<p class="text-red-600">概要の生成に失敗しました。時間をおいて再試行してください。</p>`;
+                button.textContent = '再試行 (Gemini)';
+            } finally {
+                button.disabled = false;
+            }
+        }
 
-      <footer className="max-w-7xl mx-auto px-4 py-10 text-xs text-white/50">
-        <div>© Sales Ops Portal — Demo. Single-file MVP. Replace mocks with real data sources for production.</div>
-      </footer>
-    </div>
-  );
-}
+        /**
+         * Gemini API (タイトルベース) を呼び出して記事の概要を生成する
+         * (中身は変更なし)
+         */
+        async function generateSummaryWithGemini(articleTitle) {
+            const prompt = `以下の記事タイトルを読み、想定される記事の内容を日本語で3～4文程度の簡潔な概要として作成してください。\n\nタイトル: ${articleTitle}`;
+            
+            const payload = {
+                contents: [{ 
+                    parts: [{ text: prompt }] 
+                }],
+                systemInstruction: {
+                    parts: [{ text: "あなたはプロの編集者です。提供された記事タイトルから、その記事で述べられているであろう内容を推測し、簡潔な概要を作成してください。" }]
+                },
+            };
+
+            let attempts = 0;
+            const maxAttempts = 5;
+            let delay = 1000; 
+
+            while (attempts < maxAttempts) {
+                try {
+                    const response = await fetch(GEMINI_API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        if (response.status === 429 || response.status >= 500) {
+                            throw new Error(`API Error ${response.status}: Retrying...`);
+                        }
+                        const errorData = await response.json();
+                        throw new Error(`API Error ${response.status}: ${errorData.error?.message || 'Unknown error'}`);
+                    }
+
+                    const result = await response.json();
+                    const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                    if (text) {
+                        return text;
+                    } else {
+                        throw new Error('APIから有効なテキスト応答がありませんでした。');
+                    }
+
+                } catch (error) {
+                    console.warn(error.message);
+                    attempts++;
+                    if (attempts >= maxAttempts) {
+                        throw new Error(`API呼び出しに失敗しました（${maxAttempts}回リトライ後）。`);
+                    }
+                    await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, attempts - 1)));
+                }
+            }
+            throw new Error('概要の生成に失敗しました。');
+        }
+
+
+        /**
+         * スコアに基づいたTailwindクラスを返す
+         * (中身は変更なし)
+         */
+        function getScoreStyling(score) {
+            if (score >= 5.0) {
+                return {
+                    scoreColor: 'bg-red-100',
+                    scoreTextColor: 'text-red-600'
+                };
+            } else if (score >= 3.5) {
+                return {
+                    scoreColor: 'bg-yellow-100',
+                    scoreTextColor: 'text-yellow-700'
+                };
+            } else {
+                return {
+                    scoreColor: 'bg-blue-100',
+                    scoreTextColor: 'text-blue-600'
+                };
+            }
+        }
+
+        /**
+         * エラーメッセージを表示する
+         * (中身は変更なし)
+         */
+        function showError(message) {
+            errorMessageEl.textContent = message;
+            errorEl.classList.remove('hidden');
+        }
+
+        // --- ヘルパー関数 ---
+
+        /**
+         * (新規) 選択された日付範囲に基づいて開始日を計算する
+         * @param {string} rangeKey - 'today', 'week', 'month', '3month', '6month', 'year', 'all'
+         * @returns {object} - { startDate: Date | null }
+         */
+        function getDateRange(rangeKey) {
+            const now = new Date();
+            // 今日の午前0時に設定
+            const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+            let startDate = null;
+
+            switch (rangeKey) {
+                case 'today':
+                    startDate = startOfToday;
+                    break;
+                case 'week':
+                    // 1週間前 (6日前) の午前0時
+                    startDate = new Date(startOfToday.getTime() - 6 * 24 * 60 * 60 * 1000);
+                    break;
+                case 'month':
+                    // 1か月前の日付
+                    startDate = new Date(startOfToday.getFullYear(), startOfToday.getMonth() - 1, startOfToday.getDate());
+                    break;
+                case '3month':
+                    startDate = new Date(startOfToday.getFullYear(), startOfToday.getMonth() - 3, startOfToday.getDate());
+                    break;
+                case '6month':
+                    startDate = new Date(startOfToday.getFullYear(), startOfToday.getMonth() - 6, startOfToday.getDate());
+                    break;
+                case 'year':
+                    startDate = new Date(startOfToday.getFullYear() - 1, startOfToday.getMonth(), startOfToday.getDate());
+                    break;
+                case 'all':
+                default:
+                    startDate = null; // すべて (フィルタなし)
+                    break;
+            }
+            return { startDate };
+        }
+
+        /**
+         * gvizの "Date(YYYY,MM,DD,HH,MM,SS)" 形式の文字列を Date オブジェクトに変換
+         * (中身は変更なし)
+         */
+        function parseGvizDate(gvizDate) {
+            try {
+                const parts = gvizDate.substring(5, gvizDate.length - 1).split(',');
+                const [year, month, day, hour, minute, second] = parts.map(p => parseInt(p, 10));
+                return new Date(year, month, day, hour || 0, minute || 0, second || 0);
+            } catch (e) {
+                console.error('日付のパースに失敗:', gvizDate, e);
+                return null;
+            }
+        }
+
+        /**
+         * Dateオブジェクトを "YYYY/MM/DD HH:mm" 形式の文字列にフォーマットする
+         * (中身は変更なし)
+         */
+        function formatDate(dateObj) {
+            if (!dateObj) return '日付不明';
+            return new Intl.DateTimeFormat('ja-JP', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+            }).format(dateObj);
+        }
+
+    </script>
+</body>
+</html>
+
